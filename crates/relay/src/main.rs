@@ -490,39 +490,55 @@ fn generate_allowed_hosts(
 #[tokio::main]
 async fn main() -> Result<()> {
     let opts = Opts::parse();
+    let mut loaded_serve_config = None;
 
-    let filter = EnvFilter::builder()
-        .with_default_directive(LevelFilter::INFO.into())
-        .from_env_lossy();
+    if let ServSubcommand::Serve {
+        config,
+        port,
+        host,
+        metrics_port,
+        checkpoint_freq_seconds,
+        store,
+        auth,
+        url,
+        allowed_hosts,
+    } = &opts.subcmd
+    {
+        loaded_serve_config = Some(load_config_for_serve_args(
+            config.as_ref(),
+            store,
+            port,
+            host,
+            metrics_port,
+            checkpoint_freq_seconds,
+            auth,
+            url,
+            allowed_hosts,
+        )?);
+    }
+
+    let filter = if let Some(config) = &loaded_serve_config {
+        EnvFilter::try_new(&config.logging.level).with_context(|| {
+            format!(
+                "Invalid logging.level/RUST_LOG filter: {}",
+                config.logging.level
+            )
+        })?
+    } else {
+        EnvFilter::builder()
+            .with_default_directive(LevelFilter::INFO.into())
+            .from_env_lossy()
+    };
     tracing_subscriber::registry()
         .with(tracing_subscriber::fmt::layer())
         .with(filter)
         .init();
 
     match &opts.subcmd {
-        ServSubcommand::Serve {
-            config,
-            port,
-            host,
-            metrics_port,
-            checkpoint_freq_seconds,
-            store,
-            auth,
-            url,
-            allowed_hosts,
-        } => {
-            // Load configuration
-            let config = load_config_for_serve_args(
-                config.as_ref(),
-                store,
-                port,
-                host,
-                metrics_port,
-                checkpoint_freq_seconds,
-                auth,
-                url,
-                allowed_hosts,
-            )?;
+        ServSubcommand::Serve { .. } => {
+            let config = loaded_serve_config
+                .take()
+                .expect("serve config should be loaded before tracing initialization");
 
             // Initialize logging based on config
             let log_level = &config.logging.level;
