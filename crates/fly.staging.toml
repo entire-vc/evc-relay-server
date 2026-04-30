@@ -5,7 +5,7 @@ kill_signal = "SIGTERM"
 kill_timeout = "5m0s"
 
 [build]
-  dockerfile = "Dockerfile.tiny" 
+  dockerfile = "Dockerfile.tiny.staging" 
 
 [http_service]
   internal_port = 8080

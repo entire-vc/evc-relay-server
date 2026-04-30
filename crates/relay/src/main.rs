@@ -156,6 +156,51 @@ enum ServSubcommand {
         #[clap(long)]
         file_hash: Option<String>,
     },
+
+    /// Subdoc-related maintenance commands.
+    Subdocs {
+        #[clap(subcommand)]
+        cmd: SubdocsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SubdocsCommand {
+    /// Rebuild the parent folder's `metadata.subdocs` snapshot index by
+    /// walking `filemeta_v0`, fetching each child doc, encoding its
+    /// snapshot, and writing the result back to the parent.
+    ///
+    /// The store is taken from the relay config (relay.toml + env vars,
+    /// same resolution as `serve`) unless `--store` is given as an override.
+    Index {
+        /// Path to relay.toml (defaults to standard discovery).
+        #[clap(short = 'c', long = "config")]
+        config: Option<PathBuf>,
+
+        /// Store URL override: `s3://bucket[/prefix]` or a filesystem path.
+        /// If omitted, the configured store from relay.toml/env is used.
+        #[clap(long)]
+        store: Option<String>,
+
+        /// Relay GUID prefix used to construct storage keys
+        /// (`{relay_id}-{doc_guid}/data.ysweet`).
+        #[clap(long)]
+        relay_id: String,
+
+        /// Folder doc GUID.
+        #[clap(long)]
+        folder: String,
+
+        /// Print the current coverage of the parent's subdocs index against
+        /// its `filemeta_v0` and exit. No fetches, no writes.
+        #[clap(long)]
+        check: bool,
+
+        /// Compute everything but skip both the in-memory parent mutation
+        /// and the persist back to storage. Ignored if `--check` is set.
+        #[clap(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -963,6 +1008,31 @@ async fn main() -> Result<()> {
             let id = doc_id.as_deref().or(file_hash.as_deref());
             verify_stdin(&authenticator, id).await?;
         }
+
+        ServSubcommand::Subdocs { cmd } => match cmd {
+            SubdocsCommand::Index {
+                config,
+                store,
+                relay_id,
+                folder,
+                check,
+                dry_run,
+            } => {
+                let raw_store: Box<dyn Store> = if let Some(arg) = store {
+                    get_store_from_opts(arg)?
+                } else {
+                    let cfg = Config::load(config.as_deref())?;
+                    get_store_from_config(&cfg.store)?.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "configured store is in-memory; subdocs index requires a real store. \
+                             Pass --store s3://... or --config <path> pointing at a config with a store."
+                        )
+                    })?
+                };
+                let store = Arc::new(raw_store);
+                relay::subdocs::run_backfill(store, relay_id, folder, *check, *dry_run).await?;
+            }
+        },
 
         ServSubcommand::ServeDoc {
             port,

@@ -176,6 +176,48 @@ impl SyncKv {
         })
     }
 
+    /// Build a `SyncKv` from already-loaded `data.ysweet` bytes, without
+    /// touching any [`Store`]. Returns the constructed instance plus the
+    /// embedded `modified_at` timestamp from the CBOR envelope (None if the
+    /// payload is in the legacy bincode format, which doesn't carry one).
+    ///
+    /// Useful for offline tooling that wants to reconstruct a yrs `Doc` from
+    /// raw bytes pulled from storage in a single round-trip, rather than
+    /// going through `new()` which would re-fetch.
+    pub fn from_bytes(bytes: &[u8], key: &str) -> Result<(Self, Option<u64>)> {
+        let key_str = format!("{}/data.ysweet", key);
+
+        let (data, created_at, modified_at, metadata) =
+            match ciborium::de::from_reader::<YSweetData, _>(bytes) {
+                Ok(y_data) => (
+                    y_data.data,
+                    Some(y_data.created_at),
+                    Some(y_data.modified_at),
+                    y_data.metadata,
+                ),
+                Err(cbor_err) => match bincode::deserialize::<BTreeMap<Vec<u8>, Vec<u8>>>(bytes) {
+                    Ok(data) => (data, None, None, None),
+                    Err(bincode_err) => anyhow::bail!(
+                        "Failed to deserialize data in both CBOR and bincode formats. CBOR: {}, Bincode: {}",
+                        cbor_err,
+                        bincode_err,
+                    ),
+                },
+            };
+
+        let inst = Self {
+            data: Arc::new(Mutex::new(data)),
+            store: None,
+            key: key_str,
+            dirty: AtomicBool::new(false),
+            dirty_callback: Box::new(|| ()),
+            shutdown: AtomicBool::new(false),
+            created_at,
+            metadata: Arc::new(Mutex::new(metadata)),
+        };
+        Ok((inst, modified_at))
+    }
+
     fn mark_dirty(&self) {
         if !self.dirty.load(Ordering::Relaxed) && !self.shutdown.load(Ordering::SeqCst) {
             self.dirty.store(true, Ordering::Relaxed);

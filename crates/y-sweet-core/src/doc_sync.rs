@@ -197,18 +197,31 @@ impl DocWithSyncKv {
     /// Update the snapshot for a subdocument in this document's metadata index.
     /// Also records when the subdocument was last edited.
     pub fn update_subdoc_snapshot(&self, subdoc_id: &str, encoded_snapshot: Vec<u8>) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        self.update_subdoc_snapshot_at(subdoc_id, encoded_snapshot, now);
+    }
+
+    /// Same as [`Self::update_subdoc_snapshot`] but uses an explicit
+    /// `last_edit_ms` (Unix epoch milliseconds) instead of the current wall
+    /// clock. Intended for offline backfills where the historical edit time
+    /// is known (e.g. an S3 object's `last_modified`).
+    pub fn update_subdoc_snapshot_at(
+        &self,
+        subdoc_id: &str,
+        encoded_snapshot: Vec<u8>,
+        last_edit_ms: u64,
+    ) {
         let mut metadata = self.sync_kv.get_metadata().unwrap_or_default();
 
         let subdocs = metadata
             .entry("subdocs".to_string())
             .or_insert_with(|| ciborium::value::Value::Map(Vec::new()));
 
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
         let snapshot_value = ciborium::value::Value::Bytes(encoded_snapshot);
-        let last_edit_value = ciborium::value::Value::Integer(now.into());
+        let last_edit_value = ciborium::value::Value::Integer(last_edit_ms.into());
 
         if let ciborium::value::Value::Map(ref mut entries) = subdocs {
             let key = ciborium::value::Value::Text(subdoc_id.to_string());
