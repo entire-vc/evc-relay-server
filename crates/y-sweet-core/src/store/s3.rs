@@ -343,6 +343,29 @@ impl S3Store {
         }
     }
 
+    async fn get_version(&self, key: &str, version_id: &str) -> Result<Option<Vec<u8>>> {
+        use rusty_s3::S3Action;
+        self.init().await?;
+        let prefixed_key = self.prefixed_key(key);
+        let mut object_get = self
+            .bucket
+            .get_object(Some(&self.credentials), &prefixed_key);
+        // S3 GetObject takes the version via the `versionId` query parameter.
+        // rusty-s3 doesn't expose a builder method, but `query_mut()` lets
+        // us insert it directly and the signing path picks it up.
+        object_get.query_mut().insert("versionId", version_id);
+        let response = self.store_request(Method::GET, object_get, None).await;
+
+        match response {
+            Ok(response) => {
+                let result = Self::read_response_bytes(response).await?;
+                Ok(Some(result.to_vec()))
+            }
+            Err(StoreError::DoesNotExist(_)) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn set(&self, key: &str, value: Vec<u8>) -> Result<()> {
         self.init().await?;
         let prefixed_key = self.prefixed_key(key);
@@ -387,6 +410,10 @@ impl Store for S3Store {
 
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.get(key).await
+    }
+
+    async fn get_version(&self, key: &str, version_id: &str) -> Result<Option<Vec<u8>>> {
+        self.get_version(key, version_id).await
     }
 
     async fn set(&self, key: &str, value: Vec<u8>) -> Result<()> {
@@ -555,44 +582,100 @@ impl Store for S3Store {
             .await
             .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
 
-        if !response.status().is_success() {
-            return Err(StoreError::ConnectionError(format!(
-                "Failed to list object versions: HTTP {}",
-                response.status()
-            )));
-        }
-
+        let status = response.status();
         let bytes = response
             .bytes()
             .await
             .map_err(|e| StoreError::ConnectionError(e.to_string()))?;
 
-        let parsed =
-            rusty_s3::actions::ListObjectVersions::parse_response(&bytes).map_err(|e| {
-                StoreError::ConnectionError(format!(
-                    "Error parsing S3 list versions response: {}",
-                    e
-                ))
-            })?;
+        if !status.is_success() {
+            let body = String::from_utf8_lossy(&bytes);
+            return Err(StoreError::ConnectionError(format!(
+                "Failed to list object versions: HTTP {} — {}",
+                status, body
+            )));
+        }
 
-        let versions = parsed
-            .versions
-            .into_iter()
-            .filter(|v| v.key == prefixed_key)
-            .map(|v| {
-                let ts = OffsetDateTime::parse(
-                    &v.last_modified,
-                    &time::format_description::well_known::Rfc3339,
-                )
-                .map(|dt| dt.unix_timestamp_nanos() as u64 / 1_000_000)
-                .unwrap_or(0);
-                VersionInfo {
-                    version_id: v.version_id,
-                    last_modified: ts,
-                    is_latest: v.is_latest,
+        // Parse the XML directly. We avoid `rusty_s3::actions::ListObjectVersions::parse_response`
+        // because some S3 deployments return `<Owner>` blocks without a
+        // `<DisplayName>` child, which that parser refuses; we don't need
+        // owner info anyway. We extract only Key / VersionId / IsLatest /
+        // LastModified from each `<Version>` block (and skip
+        // `<DeleteMarker>` blocks).
+        let text = String::from_utf8_lossy(&bytes);
+        let mut reader = quick_xml::Reader::from_str(&text);
+        reader.trim_text(true);
+
+        let mut buf = Vec::new();
+        let mut versions: Vec<VersionInfo> = Vec::new();
+        let mut in_version = false;
+        let mut current_key: Option<String> = None;
+        let mut current_version_id: Option<String> = None;
+        let mut current_last_modified: Option<u64> = None;
+        let mut current_is_latest = false;
+
+        loop {
+            match reader.read_event_into(&mut buf) {
+                Ok(quick_xml::events::Event::Start(e)) => match e.name().as_ref() {
+                    b"Version" => in_version = true,
+                    b"Key" if in_version => {
+                        if let Ok(t) = reader.read_text(e.name()) {
+                            current_key = Some(t.to_string());
+                        }
+                    }
+                    b"VersionId" if in_version => {
+                        if let Ok(t) = reader.read_text(e.name()) {
+                            current_version_id = Some(t.to_string());
+                        }
+                    }
+                    b"IsLatest" if in_version => {
+                        if let Ok(t) = reader.read_text(e.name()) {
+                            current_is_latest = t.eq_ignore_ascii_case("true");
+                        }
+                    }
+                    b"LastModified" if in_version => {
+                        if let Ok(t) = reader.read_text(e.name()) {
+                            if let Ok(dt) = OffsetDateTime::parse(
+                                &t,
+                                &time::format_description::well_known::Rfc3339,
+                            ) {
+                                current_last_modified =
+                                    Some(dt.unix_timestamp_nanos() as u64 / 1_000_000);
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                Ok(quick_xml::events::Event::End(e)) => {
+                    if e.name().as_ref() == b"Version" {
+                        in_version = false;
+                        if let (Some(key), Some(version_id), Some(last_modified)) = (
+                            current_key.take(),
+                            current_version_id.take(),
+                            current_last_modified.take(),
+                        ) {
+                            if key == prefixed_key {
+                                versions.push(VersionInfo {
+                                    version_id,
+                                    last_modified,
+                                    is_latest: current_is_latest,
+                                });
+                            }
+                        }
+                        current_is_latest = false;
+                    }
                 }
-            })
-            .collect();
+                Ok(quick_xml::events::Event::Eof) => break,
+                Err(e) => {
+                    return Err(StoreError::ConnectionError(format!(
+                        "Error parsing S3 list versions response: {}",
+                        e
+                    )));
+                }
+                _ => {}
+            }
+            buf.clear();
+        }
 
         Ok(versions)
     }
@@ -929,6 +1012,10 @@ impl Store for S3Store {
 
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         self.get(key).await
+    }
+
+    async fn get_version(&self, key: &str, version_id: &str) -> Result<Option<Vec<u8>>> {
+        self.get_version(key, version_id).await
     }
 
     async fn set(&self, key: &str, value: Vec<u8>) -> Result<()> {

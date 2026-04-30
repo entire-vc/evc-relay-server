@@ -75,6 +75,15 @@ pub trait Store: 'static {
         ))
     }
 
+    /// Fetch the bytes of a specific past version of `key`, identified by
+    /// the storage backend's version id (S3 `VersionId`). Returns `None` if
+    /// the (key, version) pair does not exist.
+    async fn get_version(&self, _key: &str, _version_id: &str) -> Result<Option<Vec<u8>>> {
+        Err(StoreError::UnsupportedOperation(
+            "This store does not support fetching specific versions".to_string(),
+        ))
+    }
+
     // Whether this store supports direct uploads through the server
     // (as opposed to presigned URLs that bypass the server)
     fn supports_direct_uploads(&self) -> bool {
@@ -120,6 +129,15 @@ pub trait Store: Send + Sync {
     async fn list_versions(&self, _key: &str) -> Result<Vec<VersionInfo>> {
         Err(StoreError::UnsupportedOperation(
             "This store does not support listing versions".to_string(),
+        ))
+    }
+
+    /// Fetch the bytes of a specific past version of `key`, identified by
+    /// the storage backend's version id (S3 `VersionId`). Returns `None` if
+    /// the (key, version) pair does not exist.
+    async fn get_version(&self, _key: &str, _version_id: &str) -> Result<Option<Vec<u8>>> {
+        Err(StoreError::UnsupportedOperation(
+            "This store does not support fetching specific versions".to_string(),
         ))
     }
 

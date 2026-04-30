@@ -1,7 +1,7 @@
 use anyhow::Context;
 use anyhow::Result;
 use axum::middleware;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use relay::cli::{print_auth_message, sign_stdin, verify_stdin};
 use relay::server::AllowedHost;
 use relay::stores::filesystem::FileSystemStore;
@@ -162,6 +162,125 @@ enum ServSubcommand {
         #[clap(subcommand)]
         cmd: SubdocsCommand,
     },
+
+    /// Per-document maintenance and inspection commands.
+    Doc {
+        #[clap(subcommand)]
+        cmd: DocCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum DocCommand {
+    /// Inspect a single doc — print envelope metadata, KV layout,
+    /// per-user contributions, or update history.
+    Inspect {
+        #[clap(subcommand)]
+        cmd: DocInspectCommand,
+    },
+
+    /// List S3 object versions for a single doc (newest first).
+    /// Requires the bucket to have versioning enabled.
+    Versions {
+        /// Path to relay.toml (defaults to standard discovery).
+        #[clap(short = 'c', long = "config")]
+        config: Option<PathBuf>,
+
+        /// Store URL override: `s3://bucket[/prefix]` or a filesystem path.
+        #[clap(long)]
+        store: Option<String>,
+
+        /// Relay GUID prefix used to construct the storage key.
+        #[clap(long = "relay")]
+        relay_id: String,
+
+        /// Doc GUID to list versions for.
+        #[clap(long)]
+        doc: String,
+
+        /// Limit the number of versions shown (0 = no limit).
+        #[clap(long, default_value_t = 25)]
+        limit: usize,
+    },
+
+    /// Fetch the raw `data.ysweet` bytes for a doc and write them to a file
+    /// (or stdout). With `--version`, fetches a specific past version.
+    Get {
+        /// Path to relay.toml (defaults to standard discovery).
+        #[clap(short = 'c', long = "config")]
+        config: Option<PathBuf>,
+
+        /// Store URL override: `s3://bucket[/prefix]` or a filesystem path.
+        #[clap(long)]
+        store: Option<String>,
+
+        /// Relay GUID prefix used to construct the storage key.
+        #[clap(long = "relay")]
+        relay_id: String,
+
+        /// Doc GUID.
+        #[clap(long)]
+        doc: String,
+
+        /// Specific S3 VersionId to fetch. If omitted, fetches the latest.
+        #[clap(long)]
+        version: Option<String>,
+
+        /// Output path. Defaults to stdout.
+        #[clap(short = 'o', long)]
+        output: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DocInspectCommand {
+    /// Text dump of file format, metadata, KV layout, and yrs doc stats.
+    Info {
+        #[clap(flatten)]
+        input: InspectInput,
+
+        /// Also print the raw key-value entries.
+        #[clap(long)]
+        keys: bool,
+    },
+
+    /// Per-user content contributions as JSON.
+    Users {
+        #[clap(flatten)]
+        input: InspectInput,
+    },
+
+    /// Timeline of update content diffs as JSON.
+    History {
+        #[clap(flatten)]
+        input: InspectInput,
+    },
+}
+
+/// Where the bytes for `relay doc inspect` come from. Either a local file,
+/// or fetched from the configured store using `{relay}-{doc}/data.ysweet`.
+#[derive(Args)]
+struct InspectInput {
+    /// Read from a local .ysweet file. Mutually exclusive with --doc.
+    #[clap(long)]
+    file: Option<PathBuf>,
+
+    /// Doc GUID to fetch from the configured store. Requires --relay.
+    #[clap(long, requires = "relay_id", conflicts_with = "file")]
+    doc: Option<String>,
+
+    /// Relay GUID prefix used to construct the storage key.
+    #[clap(long = "relay", requires = "doc")]
+    relay_id: Option<String>,
+
+    /// Store URL override: `s3://bucket[/prefix]` or a filesystem path.
+    /// If omitted, the configured store from relay.toml/env is used.
+    #[clap(long)]
+    store: Option<String>,
+
+    /// Path to relay.toml (defaults to standard discovery).
+    #[clap(short = 'c', long = "config")]
+    config: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -183,8 +302,8 @@ enum SubdocsCommand {
         store: Option<String>,
 
         /// Relay GUID prefix used to construct storage keys
-        /// (`{relay_id}-{doc_guid}/data.ysweet`).
-        #[clap(long)]
+        /// (`{relay}-{doc}/data.ysweet`).
+        #[clap(long = "relay")]
         relay_id: String,
 
         /// Folder doc GUID.
@@ -413,6 +532,55 @@ fn get_store_from_config(
             let store = S3Store::new(s3_store_config);
             Ok(Some(Box::new(store)))
         }
+    }
+}
+
+/// Resolve a store for an offline subcommand: explicit `--store` override
+/// wins; otherwise load relay.toml (default discovery if `config` is None)
+/// and use its configured store.
+fn build_store_for_subcommand(
+    store_override: Option<&str>,
+    config_path: Option<&PathBuf>,
+) -> Result<Arc<Box<dyn Store>>> {
+    let raw: Box<dyn Store> = if let Some(arg) = store_override {
+        get_store_from_opts(arg)?
+    } else {
+        let cfg = Config::load(config_path.map(|p| p.as_path()))?;
+        get_store_from_config(&cfg.store)?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "configured store is in-memory; this subcommand requires a real store. \
+                 Pass --store s3://... or --config <path> pointing at a config with a store."
+            )
+        })?
+    };
+    Ok(Arc::new(raw))
+}
+
+/// Resolve an `InspectInput` to (label, bytes). Either reads a local file
+/// or fetches `{relay_id}-{doc}/data.ysweet` from the configured store.
+async fn resolve_inspect_input(input: &InspectInput) -> Result<(String, Vec<u8>)> {
+    if let Some(path) = &input.file {
+        let bytes =
+            std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+        Ok((path.display().to_string(), bytes))
+    } else {
+        let doc = input
+            .doc
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("must pass --file or --doc"))?;
+        let relay_id = input
+            .relay_id
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--doc requires --relay"))?;
+        let store = build_store_for_subcommand(input.store.as_deref(), input.config.as_ref())?;
+        store.init().await.context("store init failed")?;
+        let data_key = format!("{}-{}/data.ysweet", relay_id, doc);
+        let bytes = store
+            .get(&data_key)
+            .await
+            .with_context(|| format!("get failed for {}", data_key))?
+            .ok_or_else(|| anyhow::anyhow!("no object at {}", data_key))?;
+        Ok((data_key, bytes))
     }
 }
 
@@ -1018,19 +1186,74 @@ async fn main() -> Result<()> {
                 check,
                 dry_run,
             } => {
-                let raw_store: Box<dyn Store> = if let Some(arg) = store {
-                    get_store_from_opts(arg)?
-                } else {
-                    let cfg = Config::load(config.as_deref())?;
-                    get_store_from_config(&cfg.store)?.ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "configured store is in-memory; subdocs index requires a real store. \
-                             Pass --store s3://... or --config <path> pointing at a config with a store."
-                        )
-                    })?
-                };
-                let store = Arc::new(raw_store);
+                let store = build_store_for_subcommand(store.as_deref(), config.as_ref())?;
                 relay::subdocs::run_backfill(store, relay_id, folder, *check, *dry_run).await?;
+            }
+        },
+
+        ServSubcommand::Doc { cmd } => match cmd {
+            DocCommand::Inspect { cmd } => match cmd {
+                DocInspectCommand::Info { input, keys } => {
+                    let (label, bytes) = resolve_inspect_input(input).await?;
+                    relay::doc_inspect::run_info(&label, &bytes, *keys)?;
+                }
+                DocInspectCommand::Users { input } => {
+                    let (label, bytes) = resolve_inspect_input(input).await?;
+                    relay::doc_inspect::run_users(&label, &bytes)?;
+                }
+                DocInspectCommand::History { input } => {
+                    let (label, bytes) = resolve_inspect_input(input).await?;
+                    relay::doc_inspect::run_history(&label, &bytes)?;
+                }
+            },
+            DocCommand::Versions {
+                config,
+                store,
+                relay_id,
+                doc,
+                limit,
+            } => {
+                let store = build_store_for_subcommand(store.as_deref(), config.as_ref())?;
+                let limit = if *limit == 0 { None } else { Some(*limit) };
+                relay::doc_versions::run(store, relay_id, doc, limit).await?;
+            }
+            DocCommand::Get {
+                config,
+                store,
+                relay_id,
+                doc,
+                version,
+                output,
+            } => {
+                let store = build_store_for_subcommand(store.as_deref(), config.as_ref())?;
+                store.init().await.context("store init failed")?;
+                let data_key = format!("{}-{}/data.ysweet", relay_id, doc);
+                let bytes = match version {
+                    Some(vid) => store
+                        .get_version(&data_key, vid)
+                        .await
+                        .with_context(|| format!("get_version failed for {} @ {}", data_key, vid))?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("no object at {} version {}", data_key, vid)
+                        })?,
+                    None => store
+                        .get(&data_key)
+                        .await
+                        .with_context(|| format!("get failed for {}", data_key))?
+                        .ok_or_else(|| anyhow::anyhow!("no object at {}", data_key))?,
+                };
+
+                match output {
+                    Some(path) => {
+                        std::fs::write(path, &bytes)
+                            .with_context(|| format!("failed to write {}", path.display()))?;
+                        eprintln!("wrote {} bytes to {}", bytes.len(), path.display());
+                    }
+                    None => {
+                        use std::io::Write;
+                        std::io::stdout().write_all(&bytes)?;
+                    }
+                }
             }
         },
 
