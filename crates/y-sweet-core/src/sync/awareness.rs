@@ -292,7 +292,7 @@ impl Encode for AwarenessUpdate {
     fn encode<E: Encoder>(&self, encoder: &mut E) {
         encoder.write_var(self.clients.len());
         for (&client_id, e) in self.clients.iter() {
-            encoder.write_var(client_id);
+            encoder.write_var(client_id.get());
             encoder.write_var(e.clock);
             encoder.write_string(&e.json);
         }
@@ -304,7 +304,7 @@ impl Decode for AwarenessUpdate {
         let len: usize = decoder.read_var()?;
         let mut clients = HashMap::with_capacity(len);
         for _ in 0..len {
-            let client_id: ClientID = decoder.read_var()?;
+            let client_id = ClientID::new(decoder.read_var()?);
             let clock: u32 = decoder.read_var()?;
             let json = decoder.read_string()?.to_string();
             clients.insert(client_id, AwarenessUpdateEntry { clock, json });
@@ -396,6 +396,7 @@ mod test {
 
     #[test]
     fn awareness() -> Result<(), Box<dyn std::error::Error>> {
+        let local_client = ClientID::new(1);
         let (s1, mut o_local) = channel();
         let mut local = Awareness::new(Doc::with_client_id(1));
         let _sub_local = local.on_update(move |_, e| {
@@ -410,22 +411,22 @@ mod test {
 
         local.set_local_state("{x:3}");
         let _e_local = update(&mut o_local, &local, &mut remote)?;
-        assert_eq!(remote.clients()[&1], "{x:3}");
-        assert_eq!(remote.meta[&1].clock, 1);
-        assert_eq!(o_remote.try_recv()?.added, &[1]);
+        assert_eq!(remote.clients()[&local_client], "{x:3}");
+        assert_eq!(remote.meta[&local_client].clock, 1);
+        assert_eq!(o_remote.try_recv()?.added, &[local_client]);
 
         local.set_local_state("{x:4}");
         let e_local = update(&mut o_local, &local, &mut remote)?;
         let e_remote = o_remote.try_recv()?;
-        assert_eq!(remote.clients()[&1], "{x:4}");
-        assert_eq!(e_remote, Event::new(vec![], vec![1], vec![]));
+        assert_eq!(remote.clients()[&local_client], "{x:4}");
+        assert_eq!(e_remote, Event::new(vec![], vec![local_client], vec![]));
         assert_eq!(e_remote, e_local);
 
         local.clean_local_state();
         let e_local = update(&mut o_local, &local, &mut remote)?;
         let e_remote = o_remote.try_recv()?;
         assert_eq!(e_remote.removed.len(), 1);
-        assert_eq!(local.clients().get(&1), None);
+        assert_eq!(local.clients().get(&local_client), None);
         assert_eq!(e_remote, e_local);
         Ok(())
     }

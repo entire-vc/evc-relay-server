@@ -5,6 +5,7 @@ members = [
     "relay",
     "y-sweet-core",
     "y-sign",
+    "yrs-kvstore",
 ]
 
 exclude = [
@@ -19,3 +20,4 @@ strip = true     # Strip symbols
 
 [patch.crates-io]
 rusty-s3 = { git = "https://github.com/dtkav/rusty-s3", branch = "main" }
+yrs-kvstore = { path = "yrs-kvstore" }

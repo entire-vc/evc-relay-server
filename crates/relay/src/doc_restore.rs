@@ -4,6 +4,7 @@ use std::sync::Arc;
 use y_sweet_core::doc_connection::DOC_NAME;
 use y_sweet_core::store::{Store, StoreError};
 use y_sweet_core::sync_kv::SyncKv;
+use yrs::block::ClientID;
 use yrs::updates::decoder::Decode;
 use yrs::{Any, Array, Doc, GetString, In, Map, Out, ReadTxn, StateVector, Transact, Update};
 use yrs_kvstore::DocOps;
@@ -368,9 +369,10 @@ async fn verify_one(
 
     let counts_ok = source_counts == current_counts;
     let entries_ok = source_entries == current_entries;
-    let clocks_ok = client_groups
-        .keys()
-        .all(|client_id| current_sv.get(client_id) > source_sv.get(client_id));
+    let clocks_ok = client_groups.keys().all(|client_id| {
+        let client_id = ClientID::new(*client_id);
+        current_sv.get(&client_id) > source_sv.get(&client_id)
+    });
     println!(
         "{} counts_ok={} entries_ok={} clocks_advanced={} current {} latest={}",
         target.doc_guid,
@@ -388,8 +390,8 @@ async fn verify_one(
             client_id,
             keys.len(),
             format_key_counts(&keys),
-            source_sv.get(&client_id),
-            current_sv.get(&client_id)
+            source_sv.get(&ClientID::new(client_id)),
+            current_sv.get(&ClientID::new(client_id))
         );
     }
 
@@ -533,7 +535,8 @@ async fn write_repair_attempt(
         let update = Update::decode_v1(&update)
             .map_err(|err| anyhow::anyhow!("decode generated update: {}", err))?;
         let mut txn = main_doc.transact_mut();
-        txn.apply_update(update);
+        txn.apply_update(update)
+            .map_err(|err| anyhow::anyhow!("apply generated update: {}", err))?;
     }
 
     persist_with_anyhow(&sync_kv).await?;
@@ -556,7 +559,8 @@ fn build_client_update(
         let update = Update::decode_v1(&full_update)
             .map_err(|err| anyhow::anyhow!("decode base update: {}", err))?;
         let mut txn = temp_doc.transact_mut();
-        txn.apply_update(update);
+        txn.apply_update(update)
+            .map_err(|err| anyhow::anyhow!("apply base update: {}", err))?;
     }
 
     let before = {
@@ -636,7 +640,7 @@ fn live_key_owners(doc: &Doc, roots: &[String]) -> Result<HashMap<RootKey, u64>>
     let mut deleted_ranges: HashMap<u64, Vec<(u32, u32)>> = HashMap::new();
     for (&client_id, ranges) in snapshot.delete_set.iter() {
         deleted_ranges.insert(
-            client_id,
+            client_id.get(),
             ranges
                 .iter()
                 .map(|range| (range.start, range.end))
@@ -691,7 +695,7 @@ fn fallback_client_id(doc: &Doc) -> Result<u64> {
     txn.state_vector()
         .iter()
         .max_by_key(|(_, &clock)| clock)
-        .map(|(&client_id, _)| client_id)
+        .map(|(&client_id, _)| client_id.get())
         .context("source document has no client IDs")
 }
 

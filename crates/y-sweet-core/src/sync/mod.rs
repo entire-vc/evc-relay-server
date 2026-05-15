@@ -110,7 +110,7 @@ pub trait Protocol {
         update: Update,
     ) -> Result<Option<Message>, Error> {
         let mut txn = awareness.doc().transact_mut();
-        txn.apply_update(update);
+        txn.apply_update(update)?;
         Ok(None)
     }
 
@@ -429,6 +429,10 @@ pub enum Error {
     #[error("failed to deserialize message: {0}")]
     EncodingError(#[from] yrs::encoding::read::Error),
 
+    /// Incoming Y-protocol update couldn't be applied.
+    #[error("failed to apply update: {0}")]
+    UpdateError(#[from] yrs::error::UpdateError),
+
     /// Applying incoming Y-protocol awareness update has failed.
     #[error("failed to process awareness update: {0}")]
     AwarenessEncoding(#[from] awareness::Error),
@@ -486,7 +490,7 @@ mod test {
     use yrs::encoding::write::Write;
     use yrs::updates::decoder::{Decode, DecoderV1};
     use yrs::updates::encoder::{Encode, Encoder, EncoderV1};
-    use yrs::{Doc, GetString, ReadTxn, StateVector, Text, Transact, Update};
+    use yrs::{block::ClientID, Doc, GetString, ReadTxn, StateVector, Text, Transact, Update};
 
     #[test]
     fn message_encoding() {
@@ -618,7 +622,10 @@ mod test {
             assert!(result.is_none());
         }
 
-        assert_eq!(a2.clients(), &HashMap::from([(1, "{x:3}".to_owned())]));
+        assert_eq!(
+            a2.clients(),
+            &HashMap::from([(ClientID::new(1), "{x:3}".to_owned())])
+        );
     }
 
     #[test]

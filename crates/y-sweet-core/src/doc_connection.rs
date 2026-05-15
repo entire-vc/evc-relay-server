@@ -283,7 +283,7 @@ impl DocConnection {
                             Out::Any(yrs::Any::BigInt(n)) => Some(*n as u64),
                             _ => None,
                         };
-                        if existing_id == Some(client_id) {
+                        if existing_id == Some(client_id.get()) {
                             return;
                         }
                     }
@@ -308,10 +308,10 @@ impl DocConnection {
             user_map.insert(&mut txn, "ds", yrs::ArrayPrelim::default());
         }
 
-        ids_arr.push_back(&mut txn, yrs::Any::Number(client_id as f64));
+        ids_arr.push_back(&mut txn, yrs::Any::Number(client_id.get() as f64));
         tracing::info!(
             user_id,
-            client_id,
+            client_id = client_id.get(),
             "Registered client_id for user via server-driven PUD"
         );
     }

@@ -118,7 +118,7 @@ fn load_yrs_doc(map: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<yrs::Doc> {
         .map_err(|e| anyhow::anyhow!("Failed to decode doc state: {}", e))?;
     {
         let mut txn = doc.transact_mut();
-        txn.apply_update(update);
+        let _ = txn.apply_update(update);
     }
 
     // Apply pending updates
@@ -126,7 +126,7 @@ fn load_yrs_doc(map: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<yrs::Doc> {
         if k.len() >= 7 && k[0] == 0 && k[1] == 1 && k[6] == 2 {
             if let Ok(update) = Update::decode_v1(v) {
                 let mut txn = doc.transact_mut();
-                txn.apply_update(update);
+                let _ = txn.apply_update(update);
             }
         }
     }
@@ -241,6 +241,7 @@ fn dump_users_bytes(_label: &str, bytes: &[u8]) -> Result<()> {
     let mut unmapped_clients: Vec<u64> = Vec::new();
 
     for (&client_id, _) in sv.iter() {
+        let client_id = client_id.get();
         match client_user_map.get(&client_id) {
             Some(user_id) => {
                 user_clients
@@ -263,7 +264,7 @@ fn dump_users_bytes(_label: &str, bytes: &[u8]) -> Result<()> {
         for r in ranges.iter() {
             total += (r.end - r.start) as u64;
         }
-        client_deleted.insert(cid, total);
+        client_deleted.insert(cid.get(), total);
     }
 
     let full_update = txn.encode_state_as_update_v1(&StateVector::default());
@@ -309,7 +310,7 @@ fn dump_users_bytes(_label: &str, bytes: &[u8]) -> Result<()> {
                         use yrs::updates::decoder::DecoderV1;
                         let cursor = Cursor::new(buf.as_ref());
                         let mut decoder = DecoderV1::new(cursor);
-                        if let Ok(decoded_ds) = yrs::DeleteSet::decode(&mut decoder) {
+                        if let Ok(decoded_ds) = yrs::IdSet::decode(&mut decoder) {
                             data.ds_decoded += 1;
                             for (_, ranges) in decoded_ds.iter() {
                                 for r in ranges.iter() {
@@ -351,7 +352,7 @@ fn dump_users_bytes(_label: &str, bytes: &[u8]) -> Result<()> {
             for &cid in &client_ids_for_user {
                 let clk = sv
                     .iter()
-                    .find(|(&c, _)| c == cid)
+                    .find(|(&c, _)| c.get() == cid)
                     .map(|(_, &clk)| clk)
                     .unwrap_or(0);
                 total_user_ops += clk;
@@ -366,7 +367,7 @@ fn dump_users_bytes(_label: &str, bytes: &[u8]) -> Result<()> {
         let sv = txn.state_vector();
         let mut sv_without = StateVector::default();
         for (&c, &clk) in sv.iter() {
-            if !client_ids_for_user.contains(&c) {
+            if !client_ids_for_user.contains(&c.get()) {
                 sv_without.set_max(c, clk);
             }
         }
@@ -377,7 +378,7 @@ fn dump_users_bytes(_label: &str, bytes: &[u8]) -> Result<()> {
         let user_doc = Doc::new();
         if let Ok(update) = Update::decode_v1(&diff) {
             let mut utxn = user_doc.transact_mut();
-            utxn.apply_update(update);
+            let _ = utxn.apply_update(update);
         }
         let user_content = doc_content_snapshot_filtered(&user_doc, &["users"]);
         let user_content_bytes = json_byte_size(&user_content);
@@ -514,7 +515,7 @@ fn dump_history_bytes(_label: &str, bytes: &[u8]) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Failed to decode doc state: {}", e))?;
     {
         let mut txn = doc.transact_mut();
-        txn.apply_update(update);
+        let _ = txn.apply_update(update);
     }
 
     let client_user_map = build_client_user_map(&doc);
@@ -546,7 +547,7 @@ fn dump_history_bytes(_label: &str, bytes: &[u8]) -> Result<()> {
             if let Ok(update) = Update::decode_v1(update_bytes) {
                 {
                     let mut txn = doc.transact_mut();
-                    txn.apply_update(update);
+                    let _ = txn.apply_update(update);
                 }
 
                 let new_snapshot = doc_content_snapshot_filtered(&doc, &["users"]);
@@ -798,7 +799,7 @@ fn dump_yrs_doc(map: &BTreeMap<Vec<u8>, Vec<u8>>) {
     match Update::decode_v1(doc_state_bytes) {
         Ok(update) => {
             let mut txn = doc.transact_mut();
-            txn.apply_update(update);
+            let _ = txn.apply_update(update);
             loaded = true;
         }
         Err(e) => {
@@ -812,7 +813,7 @@ fn dump_yrs_doc(map: &BTreeMap<Vec<u8>, Vec<u8>>) {
             match Update::decode_v1(v) {
                 Ok(update) => {
                     let mut txn = doc.transact_mut();
-                    txn.apply_update(update);
+                    let _ = txn.apply_update(update);
                     updates_applied += 1;
                 }
                 Err(e) => {
@@ -891,7 +892,7 @@ fn dump_yrs_doc(map: &BTreeMap<Vec<u8>, Vec<u8>>) {
     for (&client_id, ranges) in ds.iter() {
         let mut sorted: Vec<(u32, u32)> = ranges.iter().map(|r| (r.start, r.end)).collect();
         sorted.sort();
-        doc_ds_ranges.insert(client_id, sorted);
+        doc_ds_ranges.insert(client_id.get(), sorted);
     }
 
     println!(
@@ -909,14 +910,15 @@ fn dump_yrs_doc(map: &BTreeMap<Vec<u8>, Vec<u8>>) {
         }
     );
 
-    let mut client_stats: Vec<(u64, u32)> = sv.iter().map(|(&id, &clock)| (id, clock)).collect();
+    let mut client_stats: Vec<(u64, u32)> =
+        sv.iter().map(|(&id, &clock)| (id.get(), clock)).collect();
     client_stats.sort_by(|a, b| b.1.cmp(&a.1));
     println!();
     println!("  Top clients by ops:");
     for (i, (client_id, clock)) in client_stats.iter().take(10).enumerate() {
         let mut sv_all_but_one = StateVector::default();
         for (&c, &clk) in sv.iter() {
-            if c != *client_id {
+            if c.get() != *client_id {
                 sv_all_but_one.set_max(c, clk);
             }
         }
@@ -943,7 +945,7 @@ fn dump_yrs_doc(map: &BTreeMap<Vec<u8>, Vec<u8>>) {
     for (i, (client_id, clock)) in client_stats.iter().enumerate() {
         let mut sv_without = StateVector::default();
         for (&c, &clk) in sv.iter() {
-            if c != *client_id {
+            if c.get() != *client_id {
                 sv_without.set_max(c, clk);
             }
         }
@@ -952,7 +954,7 @@ fn dump_yrs_doc(map: &BTreeMap<Vec<u8>, Vec<u8>>) {
         let diff_doc = Doc::new();
         if let Ok(update) = Update::decode_v1(&diff) {
             let mut diff_txn = diff_doc.transact_mut();
-            diff_txn.apply_update(update);
+            let _ = diff_txn.apply_update(update);
             drop(diff_txn);
 
             let diff_txn = diff_doc.transact();
@@ -1029,13 +1031,13 @@ fn dump_yrs_doc(map: &BTreeMap<Vec<u8>, Vec<u8>>) {
             client_deleted += (r.end - r.start) as u64;
             num_ranges += 1;
         }
-        ds_by_client.push((client_id, client_deleted, num_ranges));
+        ds_by_client.push((client_id.get(), client_deleted, num_ranges));
     }
     ds_by_client.sort_by(|a, b| b.1.cmp(&a.1));
     for (i, (client_id, deleted, num_ranges)) in ds_by_client.iter().take(15).enumerate() {
         let ops_for_client = sv
             .iter()
-            .find(|(&c, _)| c == *client_id)
+            .find(|(&c, _)| c.get() == *client_id)
             .map(|(_, &clk)| clk)
             .unwrap_or(0);
         let pct = if ops_for_client > 0 {
@@ -1076,7 +1078,7 @@ fn dump_yrs_doc(map: &BTreeMap<Vec<u8>, Vec<u8>>) {
 
             if let Ok(update) = Update::decode_v1(&full_update_bytes) {
                 let mut txn = partial_doc.transact_mut();
-                txn.apply_update(update);
+                let _ = txn.apply_update(update);
             }
         }
 
@@ -1154,10 +1156,11 @@ fn dump_yrs_doc(map: &BTreeMap<Vec<u8>, Vec<u8>>) {
                             use yrs::updates::decoder::DecoderV1;
                             let cursor = Cursor::new(buf.as_ref());
                             let mut decoder = DecoderV1::new(cursor);
-                            match yrs::DeleteSet::decode(&mut decoder) {
+                            match yrs::IdSet::decode(&mut decoder) {
                                 Ok(decoded_ds) => {
                                     decoded_count += 1;
                                     for (&cid, ranges) in decoded_ds.iter() {
+                                        let cid = cid.get();
                                         decoded_client_ids.insert(cid);
                                         let entry = per_client_deletions
                                             .entry(cid)
@@ -1203,9 +1206,10 @@ fn dump_yrs_doc(map: &BTreeMap<Vec<u8>, Vec<u8>>) {
                         use yrs::updates::decoder::DecoderV1;
                         let cursor = Cursor::new(buf.as_ref());
                         let mut decoder = DecoderV1::new(cursor);
-                        if let Ok(decoded_ds) = yrs::DeleteSet::decode(&mut decoder) {
+                        if let Ok(decoded_ds) = yrs::IdSet::decode(&mut decoder) {
                             let mut parts = Vec::new();
                             for (&cid, ranges) in decoded_ds.iter() {
+                                let cid = cid.get();
                                 for r in ranges.iter() {
                                     parts.push(format!(
                                         "{}:{}..{} ({})",
@@ -1236,9 +1240,10 @@ fn dump_yrs_doc(map: &BTreeMap<Vec<u8>, Vec<u8>>) {
                             use yrs::updates::decoder::DecoderV1;
                             let cursor = Cursor::new(buf.as_ref());
                             let mut decoder = DecoderV1::new(cursor);
-                            if let Ok(decoded_ds) = yrs::DeleteSet::decode(&mut decoder) {
+                            if let Ok(decoded_ds) = yrs::IdSet::decode(&mut decoder) {
                                 let mut parts = Vec::new();
                                 for (&cid, ranges) in decoded_ds.iter() {
+                                    let cid = cid.get();
                                     for r in ranges.iter() {
                                         parts.push(format!(
                                             "{}:{}..{} ({})",
@@ -1386,8 +1391,9 @@ fn dump_yrs_doc(map: &BTreeMap<Vec<u8>, Vec<u8>>) {
                             use yrs::updates::decoder::DecoderV1;
                             let cursor = Cursor::new(buf.as_ref());
                             let mut decoder = DecoderV1::new(cursor);
-                            if let Ok(decoded_ds) = yrs::DeleteSet::decode(&mut decoder) {
+                            if let Ok(decoded_ds) = yrs::IdSet::decode(&mut decoder) {
                                 for (&cid, ranges) in decoded_ds.iter() {
+                                    let cid = cid.get();
                                     for r in ranges.iter() {
                                         let len = (r.end - r.start) as u64;
                                         user_total_ops += len;

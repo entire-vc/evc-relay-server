@@ -102,7 +102,8 @@ impl DocWithSyncKv {
             Update::decode_v1(update).map_err(|_| anyhow!("Failed to decode update"))?;
 
         let mut txn = doc.transact_mut();
-        txn.apply_update(update);
+        txn.apply_update(update)
+            .map_err(|err| anyhow!("Failed to apply update: {}", err))?;
 
         Ok(())
     }
