@@ -119,18 +119,33 @@ impl DocumentUpdatedEvent {
         self
     }
 
-    /// Builder method to add metadata from SyncKv
+    /// Builder method to add metadata from SyncKv.
+    ///
+    /// Runs under the shared metadata lock without cloning the map, and
+    /// excludes the `subdocs` index: it can hold thousands of entries whose
+    /// snapshot bytes have no JSON representation, and clients read subdoc
+    /// heads through MSG_QUERY_SUBDOCS rather than event payloads.
     pub fn with_metadata(mut self, sync_kv: &SyncKv) -> Self {
-        if let Some(cbor_metadata) = sync_kv.get_metadata() {
-            match cbor_metadata_to_json(&cbor_metadata) {
-                Ok(json_metadata) => {
-                    self.metadata = json_metadata;
-                }
-                Err(e) => {
-                    error!("Failed to convert CBOR metadata to JSON: {}", e);
+        const EXCLUDED_KEYS: &[&str] = &["subdocs"];
+        self.metadata = sync_kv.read_metadata(|metadata| {
+            let mut json_metadata = BTreeMap::new();
+            if let Some(map) = metadata {
+                for (key, cbor_value) in map {
+                    if EXCLUDED_KEYS.contains(&key.as_str()) {
+                        continue;
+                    }
+                    match cbor_value_to_json_value(cbor_value) {
+                        Ok(json_value) => {
+                            json_metadata.insert(key.clone(), json_value);
+                        }
+                        Err(e) => {
+                            error!("Failed to convert metadata field {} to JSON: {}", key, e);
+                        }
+                    }
                 }
             }
-        }
+            json_metadata
+        });
         self
     }
 
@@ -1315,6 +1330,42 @@ mod tests {
             assert_eq!(
                 event.metadata["version"],
                 serde_json::Value::Number(serde_json::Number::from(2))
+            );
+        });
+    }
+
+    #[test]
+    fn test_with_metadata_excludes_subdocs_index() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let sync_kv = crate::sync_kv::SyncKv::new(None, "test_doc", || ())
+                .await
+                .unwrap();
+
+            sync_kv.update_metadata(
+                "channel".to_string(),
+                ciborium::value::Value::Text("folder-1".to_string()),
+            );
+            sync_kv.update_metadata(
+                "subdocs".to_string(),
+                ciborium::value::Value::Map(vec![(
+                    ciborium::value::Value::Text("subdoc-abc".to_string()),
+                    ciborium::value::Value::Map(vec![(
+                        ciborium::value::Value::Text("snapshot".to_string()),
+                        ciborium::value::Value::Bytes(vec![1, 2, 3]),
+                    )]),
+                )]),
+            );
+
+            let event = DocumentUpdatedEvent::new("test_doc".to_string()).with_metadata(&sync_kv);
+
+            assert_eq!(
+                event.metadata["channel"],
+                serde_json::Value::String("folder-1".to_string())
+            );
+            assert!(
+                !event.metadata.contains_key("subdocs"),
+                "subdocs index must not leak into event payloads"
             );
         });
     }
