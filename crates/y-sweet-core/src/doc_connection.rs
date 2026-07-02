@@ -476,29 +476,59 @@ impl DocConnection {
                     });
                 }
 
-                let subdocs_value = self
+                // last_query feeds deletion GC, which distinguishes dormant
+                // docs (still queried) from deleted ones on a timescale of
+                // weeks; a day-granular stamp carries the same signal while
+                // making repeat queries no-ops.
+                let now = current_time_epoch_millis();
+                let day_ms = now - now % MS_PER_DAY;
+                let day_val = ciborium::value::Value::Integer(day_ms.into());
+                let last_seen_key = ciborium::value::Value::Text("last_seen".to_string());
+                let last_query_key = ciborium::value::Value::Text("last_query".to_string());
+
+                // Read under the shared lock: clone only the requested
+                // entries (not the whole index), and note which of them
+                // still need a stamp so the common repeat-query case never
+                // takes the write lock at all.
+                let guids_set: HashSet<&str> = guids.iter().map(|s| s.as_str()).collect();
+                let (entries, needs_stamp): (
+                    Vec<(ciborium::value::Value, ciborium::value::Value)>,
+                    HashSet<String>,
+                ) = self
                     .sync_kv
                     .as_ref()
-                    .and_then(|kv| kv.get_metadata())
-                    .and_then(|m| m.get("subdocs").cloned())
-                    .unwrap_or_else(|| ciborium::value::Value::Map(Vec::new()));
-
-                // Filter to requested GUIDs.
-                let entries = if let ciborium::value::Value::Map(entries) = subdocs_value {
-                    let guids_set: HashSet<&str> = guids.iter().map(|s| s.as_str()).collect();
-                    entries
-                        .into_iter()
-                        .filter(|(k, _)| {
-                            if let ciborium::value::Value::Text(key) = k {
-                                guids_set.contains(key.as_str())
-                            } else {
-                                false
+                    .map(|kv| {
+                        kv.read_metadata(|metadata| {
+                            let mut matched = Vec::new();
+                            let mut needs_stamp = HashSet::new();
+                            let Some(ciborium::value::Value::Map(all_entries)) =
+                                metadata.and_then(|m| m.get("subdocs"))
+                            else {
+                                return (matched, needs_stamp);
+                            };
+                            for (k, v) in all_entries {
+                                let ciborium::value::Value::Text(guid) = k else {
+                                    continue;
+                                };
+                                if !guids_set.contains(guid.as_str()) {
+                                    continue;
+                                }
+                                if let ciborium::value::Value::Map(fields) = v {
+                                    let has_legacy_last_seen =
+                                        fields.iter().any(|(fk, _)| *fk == last_seen_key);
+                                    let stamp_current = fields
+                                        .iter()
+                                        .any(|(fk, fv)| *fk == last_query_key && *fv == day_val);
+                                    if has_legacy_last_seen || !stamp_current {
+                                        needs_stamp.insert(guid.clone());
+                                    }
+                                }
+                                matched.push((k.clone(), v.clone()));
                             }
+                            (matched, needs_stamp)
                         })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+                    })
+                    .unwrap_or_default();
 
                 // Build response: {data: {guid: {snapshot, last_seen}, ...}}
                 let mut response_entries = Vec::new();
@@ -551,34 +581,30 @@ impl DocConnection {
                     }
                 }
 
-                // Update last-query timestamps for entries returned by this query.
-                let returned_guids: std::collections::HashSet<String> = response_entries
+                // Stamp last_query for entries returned by this query, but
+                // only take the write lock when the read pass saw a stamp
+                // that actually needs to advance (or a legacy last_seen to
+                // clear). Repeat queries within the same day stay read-only.
+                let stamp_guids: std::collections::HashSet<String> = response_entries
                     .iter()
                     .filter_map(|(k, _)| {
                         if let ciborium::value::Value::Text(guid) = k {
-                            Some(guid.clone())
+                            needs_stamp.contains(guid).then(|| guid.clone())
                         } else {
                             None
                         }
                     })
                     .collect();
 
-                if !returned_guids.is_empty() {
+                if !stamp_guids.is_empty() {
                     if let Some(kv) = self.sync_kv.as_ref() {
-                        // last_query feeds deletion GC, which distinguishes
-                        // dormant docs (still queried) from deleted ones on a
-                        // timescale of weeks. A day-granular stamp carries the
-                        // same signal while making repeat queries no-ops, so
-                        // serving the index does not re-dirty (and re-persist)
-                        // the folder.
-                        let now = current_time_epoch_millis();
-                        let day_ms = now - now % MS_PER_DAY;
-                        let day_val = ciborium::value::Value::Integer(day_ms.into());
-                        // Mutate under the metadata lock: this runs
+                        // Mutate under the metadata write lock: this runs
                         // concurrently with subdoc snapshot updates on the
                         // same parent, and an unlocked read-modify-write
                         // here erases snapshots written between the read
-                        // and the write.
+                        // and the write. The closure re-checks each field
+                        // because state may have moved between the read
+                        // pass above and this write.
                         kv.with_metadata_if_changed(|metadata| {
                             let mut changed = false;
                             if let Some(ciborium::value::Value::Map(ref mut all_entries)) =
@@ -592,31 +618,28 @@ impl DocConnection {
                                         continue;
                                     };
 
-                                    if returned_guids.contains(guid) {
+                                    if stamp_guids.contains(guid) {
                                         if let ciborium::value::Value::Map(ref mut fields) =
                                             entry_val
                                         {
                                             let fields_before = fields.len();
-                                            fields.retain(|(k, _)| {
-                                                *k != ciborium::value::Value::Text(
-                                                    "last_seen".to_string(),
-                                                )
-                                            });
+                                            fields.retain(|(k, _)| *k != last_seen_key);
                                             if fields.len() != fields_before {
                                                 changed = true;
                                             }
-                                            let lq_key = ciborium::value::Value::Text(
-                                                "last_query".to_string(),
-                                            );
-                                            if let Some(field) =
-                                                fields.iter_mut().find(|(k, _)| *k == lq_key)
+                                            if let Some(field) = fields
+                                                .iter_mut()
+                                                .find(|(k, _)| *k == last_query_key)
                                             {
                                                 if field.1 != day_val {
                                                     field.1 = day_val.clone();
                                                     changed = true;
                                                 }
                                             } else {
-                                                fields.push((lq_key, day_val.clone()));
+                                                fields.push((
+                                                    last_query_key.clone(),
+                                                    day_val.clone(),
+                                                ));
                                                 changed = true;
                                             }
                                         }

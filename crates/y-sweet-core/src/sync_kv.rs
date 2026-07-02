@@ -8,7 +8,7 @@ use std::{
     ops::Bound,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, RwLock,
     },
 };
 use yrs_kvstore::{DocOps, KVEntry};
@@ -116,7 +116,7 @@ pub struct SyncKv {
     shutdown: AtomicBool,
     created_at: Option<u64>,
     write_lease: Arc<Mutex<Option<WriteLease>>>,
-    metadata: Arc<Mutex<Option<BTreeMap<String, ciborium::value::Value>>>>,
+    metadata: Arc<RwLock<Option<BTreeMap<String, ciborium::value::Value>>>>,
 }
 
 impl SyncKv {
@@ -181,7 +181,7 @@ impl SyncKv {
             shutdown: AtomicBool::new(false),
             created_at,
             write_lease: Arc::new(Mutex::new(write_lease)),
-            metadata: Arc::new(Mutex::new(metadata)),
+            metadata: Arc::new(RwLock::new(metadata)),
         })
     }
 
@@ -223,7 +223,7 @@ impl SyncKv {
             shutdown: AtomicBool::new(false),
             created_at,
             write_lease: Arc::new(Mutex::new(None)),
-            metadata: Arc::new(Mutex::new(metadata)),
+            metadata: Arc::new(RwLock::new(metadata)),
         };
         Ok((inst, modified_at))
     }
@@ -256,7 +256,7 @@ impl SyncKv {
 
             let snapshot = {
                 let data = self.data.lock().unwrap();
-                let metadata = self.metadata.lock().unwrap();
+                let metadata = self.metadata.read().unwrap();
 
                 let y_data = YSweetData {
                     version: 1,
@@ -336,26 +336,38 @@ impl SyncKv {
 
     /// Set metadata for this document
     pub fn set_metadata(&self, metadata: BTreeMap<String, ciborium::value::Value>) {
-        let mut meta = self.metadata.lock().unwrap();
+        let mut meta = self.metadata.write().unwrap();
         *meta = Some(metadata);
         self.mark_dirty();
     }
 
     /// Get metadata for this document
     pub fn get_metadata(&self) -> Option<BTreeMap<String, ciborium::value::Value>> {
-        self.metadata.lock().unwrap().clone()
+        self.metadata.read().unwrap().clone()
     }
 
-    /// Mutate metadata in place while holding the metadata lock, then mark
-    /// the document dirty. Concurrent writers are serialized, so mutations
-    /// made through this method cannot be lost the way a
+    /// Read metadata under a shared lock without cloning the map. Readers
+    /// run concurrently with each other and only block writers, so hot read
+    /// paths (index queries) don't serialize behind one another or pay for
+    /// a full-map clone.
+    pub fn read_metadata<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(Option<&BTreeMap<String, ciborium::value::Value>>) -> R,
+    {
+        let meta = self.metadata.read().unwrap();
+        f(meta.as_ref())
+    }
+
+    /// Mutate metadata in place while holding the metadata write lock, then
+    /// mark the document dirty. Concurrent writers are serialized, so
+    /// mutations made through this method cannot be lost the way a
     /// `get_metadata`/modify/`set_metadata` sequence loses writes that land
     /// between its read and its write. Creates empty metadata when absent.
     pub fn with_metadata<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut BTreeMap<String, ciborium::value::Value>) -> R,
     {
-        let mut meta = self.metadata.lock().unwrap();
+        let mut meta = self.metadata.write().unwrap();
         let map = meta.get_or_insert_with(BTreeMap::new);
         let result = f(map);
         self.mark_dirty();
@@ -370,7 +382,7 @@ impl SyncKv {
     where
         F: FnOnce(&mut BTreeMap<String, ciborium::value::Value>) -> bool,
     {
-        let mut meta = self.metadata.lock().unwrap();
+        let mut meta = self.metadata.write().unwrap();
         let map = meta.get_or_insert_with(BTreeMap::new);
         let changed = f(map);
         if changed {
@@ -381,7 +393,7 @@ impl SyncKv {
 
     /// Update a specific metadata field
     pub fn update_metadata(&self, key: String, value: ciborium::value::Value) {
-        let mut meta = self.metadata.lock().unwrap();
+        let mut meta = self.metadata.write().unwrap();
         if let Some(ref mut metadata) = *meta {
             metadata.insert(key, value);
         } else {
