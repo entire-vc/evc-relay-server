@@ -22,6 +22,9 @@ fn current_time_epoch_millis() -> u64 {
     duration_since_epoch.as_millis() as u64
 }
 
+/// Granularity of the `last_query` stamp in the subdoc index (one UTC day).
+const MS_PER_DAY: u64 = 86_400_000;
+
 // TODO: this is an implementation detail and should not be exposed.
 pub const DOC_NAME: &str = "doc";
 
@@ -562,14 +565,22 @@ impl DocConnection {
 
                 if !returned_guids.is_empty() {
                     if let Some(kv) = self.sync_kv.as_ref() {
+                        // last_query feeds deletion GC, which distinguishes
+                        // dormant docs (still queried) from deleted ones on a
+                        // timescale of weeks. A day-granular stamp carries the
+                        // same signal while making repeat queries no-ops, so
+                        // serving the index does not re-dirty (and re-persist)
+                        // the folder.
                         let now = current_time_epoch_millis();
-                        let now_val = ciborium::value::Value::Integer(now.into());
+                        let day_ms = now - now % MS_PER_DAY;
+                        let day_val = ciborium::value::Value::Integer(day_ms.into());
                         // Mutate under the metadata lock: this runs
                         // concurrently with subdoc snapshot updates on the
                         // same parent, and an unlocked read-modify-write
                         // here erases snapshots written between the read
                         // and the write.
-                        kv.with_metadata(|metadata| {
+                        kv.with_metadata_if_changed(|metadata| {
+                            let mut changed = false;
                             if let Some(ciborium::value::Value::Map(ref mut all_entries)) =
                                 metadata.get_mut("subdocs")
                             {
@@ -585,25 +596,34 @@ impl DocConnection {
                                         if let ciborium::value::Value::Map(ref mut fields) =
                                             entry_val
                                         {
+                                            let fields_before = fields.len();
                                             fields.retain(|(k, _)| {
                                                 *k != ciborium::value::Value::Text(
                                                     "last_seen".to_string(),
                                                 )
                                             });
+                                            if fields.len() != fields_before {
+                                                changed = true;
+                                            }
                                             let lq_key = ciborium::value::Value::Text(
                                                 "last_query".to_string(),
                                             );
                                             if let Some(field) =
                                                 fields.iter_mut().find(|(k, _)| *k == lq_key)
                                             {
-                                                field.1 = now_val.clone();
+                                                if field.1 != day_val {
+                                                    field.1 = day_val.clone();
+                                                    changed = true;
+                                                }
                                             } else {
-                                                fields.push((lq_key, now_val.clone()));
+                                                fields.push((lq_key, day_val.clone()));
+                                                changed = true;
                                             }
                                         }
                                     }
                                 }
                             }
+                            changed
                         });
                     }
                 }
@@ -790,7 +810,10 @@ mod tests {
                     .unwrap();
                 if let ciborium::value::Value::Integer(ts) = &last_query.1 {
                     let ts: u64 = (*ts).try_into().unwrap();
-                    assert!(ts >= before_query);
+                    let day = |t: u64| t - t % MS_PER_DAY;
+                    // The stamp is day-granular; allow for a UTC midnight
+                    // crossing between capturing before_query and the query.
+                    assert!(ts == day(before_query) || ts == day(current_time_epoch_millis()));
                 } else {
                     panic!("Expected Integer timestamp");
                 }
@@ -803,6 +826,67 @@ mod tests {
         } else {
             panic!("Expected subdocs map");
         }
+    }
+
+    #[tokio::test]
+    async fn test_query_subdocs_repeat_query_does_not_redirty() {
+        let dirty_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dirty_count_for_callback = dirty_count.clone();
+        let sync_kv = Arc::new(
+            SyncKv::new(None, "parent_doc", move || {
+                dirty_count_for_callback.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await
+            .unwrap(),
+        );
+
+        let mut metadata = std::collections::BTreeMap::new();
+        metadata.insert(
+            "subdocs".to_string(),
+            ciborium::value::Value::Map(vec![(
+                ciborium::value::Value::Text("subdoc-abc".to_string()),
+                ciborium::value::Value::Map(vec![
+                    (
+                        ciborium::value::Value::Text("snapshot".to_string()),
+                        ciborium::value::Value::Bytes(vec![10, 20, 30]),
+                    ),
+                    (
+                        ciborium::value::Value::Text("last_edit".to_string()),
+                        ciborium::value::Value::Integer(123.into()),
+                    ),
+                ]),
+            )]),
+        );
+        sync_kv.set_metadata(metadata);
+        sync_kv.persist().await.unwrap(); // clear dirty from seeding
+
+        let doc = yrs::Doc::new();
+        let awareness = Arc::new(RwLock::new(Awareness::new(doc)));
+        let mut connection = DocConnection::new(awareness, Authorization::Full, |_| {});
+        connection.set_sync_kv(sync_kv.clone());
+
+        // First query stamps last_query for the day and dirties the doc.
+        connection
+            .handle_msg(
+                &DefaultProtocol,
+                Message::QuerySubdocs(vec!["subdoc-abc".to_string()]),
+            )
+            .unwrap();
+        let after_first = dirty_count.load(std::sync::atomic::Ordering::SeqCst);
+        sync_kv.persist().await.unwrap(); // clear dirty again
+
+        // A repeat query on the same day changes nothing and must not
+        // re-dirty the document.
+        connection
+            .handle_msg(
+                &DefaultProtocol,
+                Message::QuerySubdocs(vec!["subdoc-abc".to_string()]),
+            )
+            .unwrap();
+        assert_eq!(
+            dirty_count.load(std::sync::atomic::Ordering::SeqCst),
+            after_first
+        );
     }
 
     #[test]

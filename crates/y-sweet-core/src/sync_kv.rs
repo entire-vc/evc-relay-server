@@ -362,6 +362,23 @@ impl SyncKv {
         result
     }
 
+    /// Like [`Self::with_metadata`], but the closure reports whether it
+    /// changed anything, and the document is only marked dirty when it did.
+    /// For mutations that are frequently no-ops, this keeps the document
+    /// from being re-persisted when nothing changed.
+    pub fn with_metadata_if_changed<F>(&self, f: F) -> bool
+    where
+        F: FnOnce(&mut BTreeMap<String, ciborium::value::Value>) -> bool,
+    {
+        let mut meta = self.metadata.lock().unwrap();
+        let map = meta.get_or_insert_with(BTreeMap::new);
+        let changed = f(map);
+        if changed {
+            self.mark_dirty();
+        }
+        changed
+    }
+
     /// Update a specific metadata field
     pub fn update_metadata(&self, key: String, value: ciborium::value::Value) {
         let mut meta = self.metadata.lock().unwrap();
