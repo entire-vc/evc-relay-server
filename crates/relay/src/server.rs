@@ -376,10 +376,12 @@ impl Server {
 
         // If this doc routes to a different channel (i.e., it's a subdoc),
         // ensure the parent is loaded and hold a reference to prevent GC.
+        // The load goes through the per-key lock: concurrent subdoc loads
+        // (e.g. a folder's documents reconnecting together) otherwise race
+        // to load the same parent, and the losing insert orphans the
+        // winner's in-memory state and spawns duplicate persistence workers.
         let parent_awareness_guard = if routing_channel_name != doc_id {
-            if !self.docs.contains_key(&routing_channel_name) {
-                self.load_doc(&routing_channel_name, None).await?;
-            }
+            self.ensure_doc_loaded_boxed(&routing_channel_name).await?;
             self.docs
                 .get(&routing_channel_name)
                 .map(|parent| parent.awareness())
@@ -682,6 +684,18 @@ impl Server {
         self.load_doc_with_user(doc_id, routing_channel, user)
             .await?;
         Ok(())
+    }
+
+    /// Boxed form of [`Self::ensure_doc_loaded`] for use inside
+    /// `load_doc_with_user`, which it recursively calls to load a subdoc's
+    /// parent. The recursion terminates because a parent never routes to
+    /// another channel, and no lock cycle exists because parent loads take
+    /// only the parent's own key lock.
+    fn ensure_doc_loaded_boxed<'a>(
+        &'a self,
+        doc_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(self.ensure_doc_loaded(doc_id, None, None))
     }
 
     pub fn check_auth(
