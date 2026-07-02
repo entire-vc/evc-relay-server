@@ -992,11 +992,9 @@ async fn main() -> Result<()> {
                 tracing::info!("Metrics disabled");
             }
 
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to install CTRL+C signal handler");
+            let signal = shutdown_signal().await;
 
-            tracing::info!("Shutting down.");
+            tracing::info!("Received {}, shutting down.", signal);
             token.cancel();
 
             if let Some(metrics_handle) = metrics_handle {
@@ -1454,26 +1452,8 @@ async fn main() -> Result<()> {
 
             tracing::info!("Listening on http://{}", addr);
 
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("Received Ctrl+C, shutting down.");
-                },
-                _ = async {
-                    #[cfg(unix)]
-                    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                        Ok(mut signal) => signal.recv().await,
-                        Err(e) => {
-                            tracing::error!("Failed to install SIGTERM handler: {}", e);
-                            std::future::pending::<Option<()>>().await
-                        }
-                    }
-
-                    #[cfg(not(unix))]
-                    std::future::pending::<Option<()>>().await
-                } => {
-                    tracing::info!("Received SIGTERM, shutting down.");
-                }
-            }
+            let signal = shutdown_signal().await;
+            tracing::info!("Received {}, shutting down.", signal);
 
             cancellation_token.cancel();
             tracing::info!("Server shut down.");
@@ -1481,6 +1461,34 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve when the process receives a shutdown signal: SIGTERM (what
+/// process supervisors and container platforms send on stop/deploy) or
+/// Ctrl+C/SIGINT (interactive use).
+async fn shutdown_signal() -> &'static str {
+    let ctrl_c = tokio::signal::ctrl_c();
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => {
+                tracing::error!("Failed to install SIGTERM handler: {}", e);
+                std::future::pending::<()>().await
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => "SIGINT",
+        _ = terminate => "SIGTERM",
+    }
 }
 
 #[cfg(test)]
