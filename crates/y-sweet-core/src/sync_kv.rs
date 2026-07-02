@@ -346,6 +346,22 @@ impl SyncKv {
         self.metadata.lock().unwrap().clone()
     }
 
+    /// Mutate metadata in place while holding the metadata lock, then mark
+    /// the document dirty. Concurrent writers are serialized, so mutations
+    /// made through this method cannot be lost the way a
+    /// `get_metadata`/modify/`set_metadata` sequence loses writes that land
+    /// between its read and its write. Creates empty metadata when absent.
+    pub fn with_metadata<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut BTreeMap<String, ciborium::value::Value>) -> R,
+    {
+        let mut meta = self.metadata.lock().unwrap();
+        let map = meta.get_or_insert_with(BTreeMap::new);
+        let result = f(map);
+        self.mark_dirty();
+        result
+    }
+
     /// Update a specific metadata field
     pub fn update_metadata(&self, key: String, value: ciborium::value::Value) {
         let mut meta = self.metadata.lock().unwrap();

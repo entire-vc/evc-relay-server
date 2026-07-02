@@ -215,55 +215,57 @@ impl DocWithSyncKv {
         encoded_snapshot: Vec<u8>,
         last_edit_ms: u64,
     ) {
-        let mut metadata = self.sync_kv.get_metadata().unwrap_or_default();
-
-        let subdocs = metadata
-            .entry("subdocs".to_string())
-            .or_insert_with(|| ciborium::value::Value::Map(Vec::new()));
-
         let snapshot_value = ciborium::value::Value::Bytes(encoded_snapshot);
         let last_edit_value = ciborium::value::Value::Integer(last_edit_ms.into());
 
-        if let ciborium::value::Value::Map(ref mut entries) = subdocs {
-            let key = ciborium::value::Value::Text(subdoc_id.to_string());
-            if let Some((_, entry_value)) = entries.iter_mut().find(|(k, _)| *k == key) {
-                if let ciborium::value::Value::Map(fields) = entry_value {
-                    fields.retain(|(k, _)| {
-                        *k != ciborium::value::Value::Text("last_seen".to_string())
-                            && *k != ciborium::value::Value::Text("state_vector".to_string())
-                    });
-                    upsert_cbor_field(fields, "snapshot", snapshot_value);
-                    upsert_cbor_field(fields, "last_edit", last_edit_value);
-                } else {
-                    *entry_value = ciborium::value::Value::Map(vec![
-                        (
-                            ciborium::value::Value::Text("snapshot".to_string()),
-                            snapshot_value,
-                        ),
-                        (
-                            ciborium::value::Value::Text("last_edit".to_string()),
-                            last_edit_value,
-                        ),
-                    ]);
-                }
-            } else {
-                entries.push((
-                    key,
-                    ciborium::value::Value::Map(vec![
-                        (
-                            ciborium::value::Value::Text("snapshot".to_string()),
-                            snapshot_value,
-                        ),
-                        (
-                            ciborium::value::Value::Text("last_edit".to_string()),
-                            last_edit_value,
-                        ),
-                    ]),
-                ));
-            }
-        }
+        // Mutate under the metadata lock: subdoc update callbacks and index
+        // queries touch this map concurrently, and an unlocked
+        // read-modify-write here loses entries written between the read and
+        // the write.
+        self.sync_kv.with_metadata(|metadata| {
+            let subdocs = metadata
+                .entry("subdocs".to_string())
+                .or_insert_with(|| ciborium::value::Value::Map(Vec::new()));
 
-        self.sync_kv.set_metadata(metadata);
+            if let ciborium::value::Value::Map(ref mut entries) = subdocs {
+                let key = ciborium::value::Value::Text(subdoc_id.to_string());
+                if let Some((_, entry_value)) = entries.iter_mut().find(|(k, _)| *k == key) {
+                    if let ciborium::value::Value::Map(fields) = entry_value {
+                        fields.retain(|(k, _)| {
+                            *k != ciborium::value::Value::Text("last_seen".to_string())
+                                && *k != ciborium::value::Value::Text("state_vector".to_string())
+                        });
+                        upsert_cbor_field(fields, "snapshot", snapshot_value);
+                        upsert_cbor_field(fields, "last_edit", last_edit_value);
+                    } else {
+                        *entry_value = ciborium::value::Value::Map(vec![
+                            (
+                                ciborium::value::Value::Text("snapshot".to_string()),
+                                snapshot_value,
+                            ),
+                            (
+                                ciborium::value::Value::Text("last_edit".to_string()),
+                                last_edit_value,
+                            ),
+                        ]);
+                    }
+                } else {
+                    entries.push((
+                        key,
+                        ciborium::value::Value::Map(vec![
+                            (
+                                ciborium::value::Value::Text("snapshot".to_string()),
+                                snapshot_value,
+                            ),
+                            (
+                                ciborium::value::Value::Text("last_edit".to_string()),
+                                last_edit_value,
+                            ),
+                        ]),
+                    ));
+                }
+            }
+        });
     }
 
     /// Get the subdocument snapshot index from metadata.
@@ -417,6 +419,68 @@ mod tests {
 
             let s2 = snapshots.iter().find(|(id, _)| id == "subdoc-2").unwrap();
             assert_eq!(s2.1, vec![4, 5, 6]);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_concurrent_subdoc_snapshot_updates_keep_all_entries() {
+        let store = MemoryStore::default();
+        let dwskv = Arc::new(
+            DocWithSyncKv::new("parent_doc", Some(Arc::new(Box::new(store))), || (), None)
+                .await
+                .unwrap(),
+        );
+
+        // Writers update distinct subdocs while a query-style writer stamps
+        // every entry, mirroring subdoc update callbacks racing
+        // MSG_QUERY_SUBDOCS handling on the same parent. Every writer's last
+        // update must survive: losing one means a reader was able to write
+        // back a stale copy of the whole map.
+        const WRITERS: usize = 8;
+        const UPDATES_PER_WRITER: usize = 200;
+
+        let mut handles = Vec::new();
+        for w in 0..WRITERS {
+            let dwskv = dwskv.clone();
+            handles.push(std::thread::spawn(move || {
+                let subdoc_id = format!("subdoc-{w}");
+                for i in 0..UPDATES_PER_WRITER {
+                    dwskv.update_subdoc_snapshot(&subdoc_id, vec![w as u8, i as u8]);
+                }
+            }));
+        }
+        {
+            let dwskv = dwskv.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..UPDATES_PER_WRITER {
+                    dwskv.sync_kv().with_metadata(|metadata| {
+                        if let Some(ciborium::value::Value::Map(entries)) =
+                            metadata.get_mut("subdocs")
+                        {
+                            for (_, entry_val) in entries {
+                                if let ciborium::value::Value::Map(fields) = entry_val {
+                                    upsert_cbor_field(
+                                        fields,
+                                        "last_query",
+                                        ciborium::value::Value::Integer((i as u64).into()),
+                                    );
+                                }
+                            }
+                        }
+                    });
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let snapshots = dwskv.get_subdoc_snapshots().unwrap();
+        assert_eq!(snapshots.len(), WRITERS);
+        for w in 0..WRITERS {
+            let subdoc_id = format!("subdoc-{w}");
+            let entry = snapshots.iter().find(|(id, _)| *id == subdoc_id).unwrap();
+            assert_eq!(entry.1, vec![w as u8, (UPDATES_PER_WRITER - 1) as u8]);
         }
     }
 

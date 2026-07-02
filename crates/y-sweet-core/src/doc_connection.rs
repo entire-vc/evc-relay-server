@@ -564,7 +564,12 @@ impl DocConnection {
                     if let Some(kv) = self.sync_kv.as_ref() {
                         let now = current_time_epoch_millis();
                         let now_val = ciborium::value::Value::Integer(now.into());
-                        if let Some(mut metadata) = kv.get_metadata() {
+                        // Mutate under the metadata lock: this runs
+                        // concurrently with subdoc snapshot updates on the
+                        // same parent, and an unlocked read-modify-write
+                        // here erases snapshots written between the read
+                        // and the write.
+                        kv.with_metadata(|metadata| {
                             if let Some(ciborium::value::Value::Map(ref mut all_entries)) =
                                 metadata.get_mut("subdocs")
                             {
@@ -598,10 +603,8 @@ impl DocConnection {
                                         }
                                     }
                                 }
-
-                                kv.set_metadata(metadata);
                             }
-                        }
+                        });
                     }
                 }
 
