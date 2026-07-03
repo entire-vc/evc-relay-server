@@ -237,7 +237,6 @@ pub struct Server {
     allowed_hosts: Vec<AllowedHost>,
     cancellation_token: CancellationToken,
     /// Whether to garbage collect docs that are no longer in use.
-    /// Disabled for single-doc mode, since we only have one doc.
     doc_gc: bool,
     event_dispatcher: Option<Arc<dyn EventDispatcher>>,
     sync_protocol_event_sender: Arc<SyncProtocolEventSender>,
@@ -753,14 +752,6 @@ impl Server {
         ))
     }
 
-    pub fn single_doc_routes_with_metrics(self: &Arc<Self>) -> Router {
-        self.single_doc_routes()
-            .layer(middleware::from_fn_with_state(
-                self.clone(),
-                auth_metrics_middleware,
-            ))
-    }
-
     pub fn routes(self: &Arc<Self>) -> Router {
         let mut router = Router::new()
             .route("/ready", get(ready))
@@ -808,14 +799,6 @@ impl Server {
         }
 
         router.with_state(self.clone())
-    }
-
-    pub fn single_doc_routes(self: &Arc<Self>) -> Router {
-        Router::new()
-            .route("/ws/:doc_id", get(handle_socket_upgrade_single))
-            .route("/as-update", get(get_doc_as_update_single))
-            .route("/update", post(update_doc_single))
-            .with_state(self.clone())
     }
 
     pub fn metrics_routes(self: &Arc<Self>) -> Router {
@@ -872,12 +855,6 @@ impl Server {
         s.serve_internal(listener, redact_errors, routes).await
     }
 
-    pub async fn serve_doc(self, listener: TcpListener, redact_errors: bool) -> Result<()> {
-        let s = Arc::new(self);
-        let routes = s.single_doc_routes_with_metrics();
-        s.serve_internal(listener, redact_errors, routes).await
-    }
-
     pub async fn serve_metrics(self, listener: TcpListener) -> Result<()> {
         let s = Arc::new(self);
         let routes = s.metrics_routes();
@@ -918,14 +895,6 @@ impl Server {
         } else {
             Ok(Authorization::Full)
         }
-    }
-
-    fn get_single_doc_id(&self) -> Result<String, AppError> {
-        self.docs
-            .iter()
-            .next()
-            .map(|entry| entry.key().clone())
-            .ok_or_else(|| AppError::new(StatusCode::NOT_FOUND, anyhow!("No document found")))
     }
 }
 
@@ -972,14 +941,6 @@ async fn update_doc_deprecated(
     update_doc(Path(doc_id), State(server_state), auth_header, body).await
 }
 
-async fn get_doc_as_update_single(
-    State(server_state): State<Arc<Server>>,
-    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
-) -> Result<Response, AppError> {
-    let doc_id = server_state.get_single_doc_id()?;
-    get_doc_as_update(State(server_state), Path(doc_id), auth_header).await
-}
-
 async fn update_doc(
     Path(doc_id): Path<String>,
     State(server_state): State<Arc<Server>>,
@@ -1016,46 +977,6 @@ async fn update_doc_inner(
     }
 
     Ok(StatusCode::OK.into_response())
-}
-
-async fn update_doc_single(
-    State(server_state): State<Arc<Server>>,
-    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
-    body: Bytes,
-) -> Result<Response, AppError> {
-    let doc_id = server_state.get_single_doc_id()?;
-    let token = get_token_from_header(auth_header);
-    let authorization = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
-    update_doc_inner(doc_id, server_state, authorization, body).await
-}
-
-async fn handle_socket_upgrade(
-    ws: WebSocketUpgrade,
-    Path(doc_id): Path<String>,
-    authorization: Authorization,
-    State(server_state): State<Arc<Server>>,
-) -> Result<Response, AppError> {
-    handle_socket_upgrade_with_channel(ws, Path(doc_id), authorization, None, State(server_state))
-        .await
-}
-
-async fn handle_socket_upgrade_with_channel(
-    ws: WebSocketUpgrade,
-    Path(doc_id): Path<String>,
-    authorization: Authorization,
-    routing_channel: Option<String>,
-    State(server_state): State<Arc<Server>>,
-) -> Result<Response, AppError> {
-    handle_socket_upgrade_with_channel_and_user(
-        ws,
-        Path(doc_id),
-        authorization,
-        routing_channel,
-        None,
-        None, // No token available at this level
-        State(server_state),
-    )
-    .await
 }
 
 async fn handle_socket_upgrade_with_channel_and_user(
@@ -1225,25 +1146,6 @@ async fn handle_socket_upgrade_full_path(
         State(server_state),
     )
     .await
-}
-
-async fn handle_socket_upgrade_single(
-    ws: WebSocketUpgrade,
-    Path(doc_id): Path<String>,
-    auth_header: Option<TypedHeader<headers::Authorization<headers::authorization::Bearer>>>,
-    State(server_state): State<Arc<Server>>,
-) -> Result<Response, AppError> {
-    let single_doc_id = server_state.get_single_doc_id()?;
-    if doc_id != single_doc_id {
-        return Err(AppError::new(
-            StatusCode::NOT_FOUND,
-            anyhow!("Document not found"),
-        ));
-    }
-
-    let token = get_token_from_header(auth_header);
-    let authorization = server_state.verify_doc_token(token.as_deref(), &doc_id)?;
-    handle_socket_upgrade(ws, Path(single_doc_id), authorization, State(server_state)).await
 }
 
 async fn handle_socket(

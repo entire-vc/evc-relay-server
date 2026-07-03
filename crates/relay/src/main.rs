@@ -148,17 +148,6 @@ enum ServSubcommand {
         cmd: ConfigSubcommand,
     },
 
-    ServeDoc {
-        #[clap(long)]
-        port: Option<u16>,
-
-        #[clap(long)]
-        host: Option<IpAddr>,
-
-        #[clap(long)]
-        checkpoint_freq_seconds: Option<u64>,
-    },
-
     Sign {
         #[clap(long)]
         auth: String,
@@ -1360,104 +1349,6 @@ async fn main() -> Result<()> {
                 .await?;
             }
         },
-
-        ServSubcommand::ServeDoc {
-            port,
-            host,
-            checkpoint_freq_seconds,
-        } => {
-            let doc_id = env::var("SESSION_BACKEND_KEY").expect("SESSION_BACKEND_KEY must be set");
-
-            let store = if let Ok(bucket) = env::var("STORAGE_BUCKET") {
-                let prefix = if let Ok(prefix) = env::var("STORAGE_PREFIX") {
-                    // If the prefix is set, it should contain the document ID as its last '/'-separated part.
-                    // We want to pop that, because we will add it back when accessing the doc.
-                    let mut parts: Vec<&str> = prefix.split('/').collect();
-                    if let Some(last) = parts.pop() {
-                        if last != doc_id {
-                            anyhow::bail!("STORAGE_PREFIX must end with the document ID. Found: {} Expected: {}", last, doc_id);
-                        }
-
-                        let prefix = parts.join("/");
-                        Some(prefix)
-                    } else {
-                        // As far as y-sweet is concerned, `STORAGE_BUCKET` = "" is equivalent to `STORAGE_BUCKET` not being set.
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                // Use the unified S3Config::from_env method with explicit bucket and prefix
-                let s3_config = S3Config::from_env(Some(bucket), prefix)?;
-                tracing::info!(
-                    "Store backend: s3 bucket={} endpoint={} prefix={}",
-                    s3_config.bucket,
-                    s3_config.endpoint,
-                    s3_config.bucket_prefix.as_deref().unwrap_or("(none)"),
-                );
-                let store = S3Store::new(s3_config);
-                let store: Box<dyn Store> = Box::new(store);
-                store.init().await?;
-                Some(store)
-            } else {
-                if env::var("STORAGE_PREFIX").is_ok() {
-                    anyhow::bail!("If STORAGE_PREFIX is set, STORAGE_BUCKET must also be set.");
-                }
-                tracing::warn!("No store set. Documents will be stored in memory only.");
-
-                None
-            };
-
-            let cancellation_token = CancellationToken::new();
-
-            // Load webhook configs from environment for single doc mode
-            let webhook_configs = relay::webhook::load_webhook_configs();
-            if let Some(ref configs) = webhook_configs {
-                tracing::info!(
-                    "Loaded {} webhook configurations for single doc mode from environment",
-                    configs.len()
-                );
-            }
-
-            let server = relay::server::Server::new(
-                store,
-                std::time::Duration::from_secs(checkpoint_freq_seconds.unwrap_or(10)),
-                None,   // No authenticator
-                None,   // No URL prefix
-                vec![], // No allowed hosts for single doc mode
-                cancellation_token.clone(),
-                false,
-                webhook_configs,
-            )
-            .await?;
-
-            // Load the one document we're operating with
-            server
-                .load_doc(&doc_id, None)
-                .await
-                .context("Failed to load document")?;
-
-            let addr = SocketAddr::new(
-                host.unwrap_or(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
-                port.unwrap_or(8080),
-            );
-
-            let listener = TcpListener::bind(addr).await?;
-            let addr = listener.local_addr()?;
-
-            tokio::spawn(async move {
-                server.serve_doc(listener, false).await.unwrap();
-            });
-
-            tracing::info!("Listening on http://{}", addr);
-
-            let signal = shutdown_signal().await;
-            tracing::info!("Received {}, shutting down.", signal);
-
-            cancellation_token.cancel();
-            tracing::info!("Server shut down.");
-        }
     }
 
     Ok(())
