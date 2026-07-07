@@ -28,6 +28,10 @@ pub enum CwtError {
     InvalidAudience { expected: String, found: String },
     #[error("Missing audience claim: expected '{expected}'")]
     MissingAudience { expected: String },
+    #[error("Token has expired")]
+    TokenExpired,
+    #[error("Scope violation: {reason}")]
+    ScopeViolation { reason: String },
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -669,6 +673,7 @@ impl CwtAuthenticator {
 
         let claims = self.extract_claims_from_payload(&payload)?;
         self.validate_audience(&claims, expected_audience)?;
+        self.validate_expiration(&claims)?;
         Ok(claims)
     }
 
@@ -758,6 +763,7 @@ impl CwtAuthenticator {
 
         let claims = self.extract_claims_from_payload(&payload)?;
         self.validate_audience(&claims, expected_audience)?;
+        self.validate_expiration(&claims)?;
         Ok(claims)
     }
 
@@ -768,6 +774,19 @@ impl CwtAuthenticator {
         })?;
 
         self.parse_claims_map(claims_map)
+    }
+
+    fn validate_expiration(&self, claims: &CwtClaims) -> Result<(), CwtError> {
+        if let Some(exp) = claims.expiration {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            if now >= exp {
+                return Err(CwtError::TokenExpired);
+            }
+        }
+        Ok(())
     }
 
     fn validate_audience(
@@ -1075,6 +1094,46 @@ pub fn scope_to_permission(scope: &str) -> Result<Permission, CwtError> {
     }
 }
 
+/// Verify that the claims in a verified token permit access to the given doc.
+///
+/// Allowed: `doc:<doc_id>:*` matching exactly, `prefix:<prefix>:*` where doc_id starts with
+/// prefix, or `server` (unrestricted). File-scoped tokens and mismatched doc tokens are denied.
+pub fn check_scope_for_doc(claims: &CwtClaims, doc_id: &str) -> Result<(), CwtError> {
+    match scope_to_permission(&claims.scope) {
+        Ok(Permission::Doc(doc_perm)) => {
+            if doc_perm.doc_id == doc_id {
+                Ok(())
+            } else {
+                Err(CwtError::ScopeViolation {
+                    reason: format!(
+                        "token scoped to doc '{}', cannot access doc '{}'",
+                        doc_perm.doc_id, doc_id
+                    ),
+                })
+            }
+        }
+        Ok(Permission::Prefix(prefix_perm)) => {
+            if doc_id.starts_with(&prefix_perm.prefix) {
+                Ok(())
+            } else {
+                Err(CwtError::ScopeViolation {
+                    reason: format!(
+                        "token prefix '{}' does not cover doc '{}'",
+                        prefix_perm.prefix, doc_id
+                    ),
+                })
+            }
+        }
+        Ok(Permission::Server) => Ok(()),
+        Ok(Permission::File(_)) => Err(CwtError::ScopeViolation {
+            reason: "file-scoped token cannot be used for doc access".to_string(),
+        }),
+        Err(_) => Err(CwtError::ScopeViolation {
+            reason: format!("invalid scope format: '{}'", claims.scope),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1092,7 +1151,7 @@ mod tests {
             issuer: Some("relay-server".to_string()),
             subject: None,
             audience: Some("https://api.example.com".to_string()),
-            expiration: Some(1444064944),
+            expiration: Some(9999999999),
             issued_at: Some(1443944944),
             scope: "server".to_string(),
             channel: None,
@@ -1108,8 +1167,8 @@ mod tests {
 
         assert_eq!(parsed_claims.scope, "server");
         assert_eq!(parsed_claims.issuer, Some("relay-server".to_string()));
-        assert_eq!(parsed_claims.expiration, Some(1444064944));
-        assert_eq!(parsed_claims.issued_at, Some(1443944944));
+        assert_eq!(parsed_claims.expiration, Some(9999999999));
+        assert_eq!(parsed_claims.issued_at, Some(1443944944)); // iat stays as-is
     }
 
     #[test]
@@ -1120,7 +1179,7 @@ mod tests {
             issuer: Some("relay-server".to_string()),
             subject: None,
             audience: Some("https://api.example.com".to_string()),
-            expiration: Some(1444064944),
+            expiration: Some(9999999999),
             issued_at: Some(1443944944),
             scope: "doc:test_doc_123:rw".to_string(),
             channel: None,
@@ -1143,7 +1202,7 @@ mod tests {
             issuer: Some("relay-server".to_string()),
             subject: None,
             audience: Some("https://api.example.com".to_string()),
-            expiration: Some(1444064944),
+            expiration: Some(9999999999),
             issued_at: None,
             scope: "file:abcdef1234567890:doc123:r".to_string(),
             channel: None,
@@ -1226,7 +1285,7 @@ mod tests {
             issuer: Some("relay-server".to_string()),
             subject: Some("admin@org123.com".to_string()),
             audience: Some("https://api.example.com".to_string()),
-            expiration: Some(1444064944),
+            expiration: Some(9999999999),
             issued_at: Some(1443944944),
             scope: "prefix:org123-:rw".to_string(),
             channel: None,
@@ -1240,8 +1299,8 @@ mod tests {
         assert_eq!(parsed_claims.scope, "prefix:org123-:rw");
         assert_eq!(parsed_claims.subject, Some("admin@org123.com".to_string()));
         assert_eq!(parsed_claims.issuer, Some("relay-server".to_string()));
-        assert_eq!(parsed_claims.expiration, Some(1444064944));
-        assert_eq!(parsed_claims.issued_at, Some(1443944944));
+        assert_eq!(parsed_claims.expiration, Some(9999999999));
+        assert_eq!(parsed_claims.issued_at, Some(1443944944)); // iat stays as-is
     }
 
     #[test]
@@ -1263,7 +1322,7 @@ mod tests {
             issuer: Some("coap://as.example.com".to_string()),
             subject: Some("erikw".to_string()),
             audience: Some("coap://light.example.com".to_string()),
-            expiration: Some(1444064944),
+            expiration: Some(9999999999),
             issued_at: Some(1443944944),
             scope: "server".to_string(), // Using our custom scope claim
             channel: None,
@@ -1336,8 +1395,8 @@ mod tests {
             parsed_claims.audience,
             Some("coap://light.example.com".to_string())
         );
-        assert_eq!(parsed_claims.expiration, Some(1444064944));
-        assert_eq!(parsed_claims.issued_at, Some(1443944944));
+        assert_eq!(parsed_claims.expiration, Some(1444064944)); // RFC 8392 test vector value (hardcoded bytes)
+        assert_eq!(parsed_claims.issued_at, Some(1443944944)); // iat stays as-is
         // Note: The scope will be empty/default since RFC example has cti (7) not scope (9)
 
         // Test 2: Try to verify a manually constructed COSE_Mac0 without tags
@@ -1350,7 +1409,7 @@ mod tests {
                     issuer: Some("coap://as.example.com".to_string()),
                     subject: Some("erikw".to_string()),
                     audience: Some("coap://light.example.com".to_string()),
-                    expiration: Some(1444064944),
+                    expiration: Some(9999999999),
                     issued_at: Some(1443944944),
                     scope: "server".to_string(),
                     channel: None,
@@ -1423,7 +1482,7 @@ mod tests {
             issuer: Some("test-issuer".to_string()),
             subject: None,
             audience: Some("https://api.example.com".to_string()),
-            expiration: Some(1444064944),
+            expiration: Some(9999999999),
             issued_at: Some(1443944944),
             scope: "doc:test_doc:rw".to_string(),
             channel: Some("team-updates".to_string()),
@@ -1442,7 +1501,7 @@ mod tests {
             issuer: Some("test-issuer".to_string()),
             subject: None,
             audience: Some("https://api.example.com".to_string()),
-            expiration: Some(1444064944),
+            expiration: Some(9999999999),
             issued_at: Some(1443944944),
             scope: "doc:test_doc:rw".to_string(),
             channel: None,
@@ -1704,6 +1763,134 @@ mod tests {
             .is_ok());
     }
 
+    // ── H6 fixes ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_expired_token_rejected() {
+        let authenticator = create_test_authenticator();
+
+        // exp = 1 is 1970-01-01T00:00:01Z — always in the past
+        let claims = CwtClaims {
+            issuer: Some("relay-server".to_string()),
+            subject: None,
+            audience: Some("https://api.example.com".to_string()),
+            expiration: Some(1),
+            issued_at: None,
+            scope: "server".to_string(),
+            channel: None,
+        };
+
+        let token = authenticator.create_cwt(claims).unwrap();
+        let result = authenticator.verify_cwt(&token, "https://api.example.com");
+        assert_eq!(
+            result,
+            Err(CwtError::TokenExpired),
+            "token with past exp must be rejected"
+        );
+
+        // Sanity: token without exp is still accepted
+        let no_exp_claims = CwtClaims {
+            issuer: None,
+            subject: None,
+            audience: Some("https://api.example.com".to_string()),
+            expiration: None,
+            issued_at: None,
+            scope: "server".to_string(),
+            channel: None,
+        };
+        let no_exp_token = authenticator.create_cwt(no_exp_claims).unwrap();
+        assert!(
+            authenticator
+                .verify_cwt(&no_exp_token, "https://api.example.com")
+                .is_ok(),
+            "token without exp claim must still be accepted"
+        );
+    }
+
+    #[test]
+    fn test_cross_doc_scope_rejected() {
+        let authenticator = create_test_authenticator();
+
+        // Token scoped to doc_A
+        let claims = CwtClaims {
+            issuer: Some("relay-server".to_string()),
+            subject: None,
+            audience: Some("https://api.example.com".to_string()),
+            expiration: Some(9999999999),
+            issued_at: None,
+            scope: "doc:doc_A:rw".to_string(),
+            channel: None,
+        };
+
+        let token = authenticator.create_cwt(claims.clone()).unwrap();
+        let verified = authenticator
+            .verify_cwt(&token, "https://api.example.com")
+            .unwrap();
+
+        // Access to doc_A must be allowed
+        assert!(
+            check_scope_for_doc(&verified, "doc_A").is_ok(),
+            "token for doc_A must allow access to doc_A"
+        );
+
+        // Access to doc_B must be denied (cross-doc)
+        let cross_doc_result = check_scope_for_doc(&verified, "doc_B");
+        assert!(
+            matches!(cross_doc_result, Err(CwtError::ScopeViolation { .. })),
+            "token for doc_A must NOT allow access to doc_B, got: {:?}",
+            cross_doc_result
+        );
+
+        // Prefix token: access to matching prefix allowed, non-matching denied
+        let prefix_claims = CwtClaims {
+            issuer: None,
+            subject: None,
+            audience: Some("https://api.example.com".to_string()),
+            expiration: Some(9999999999),
+            issued_at: None,
+            scope: "prefix:org123-:rw".to_string(),
+            channel: None,
+        };
+        let prefix_token = authenticator.create_cwt(prefix_claims).unwrap();
+        let prefix_verified = authenticator
+            .verify_cwt(&prefix_token, "https://api.example.com")
+            .unwrap();
+
+        assert!(
+            check_scope_for_doc(&prefix_verified, "org123-my-doc").is_ok(),
+            "prefix token must allow doc within prefix"
+        );
+        assert!(
+            matches!(
+                check_scope_for_doc(&prefix_verified, "other-org-doc"),
+                Err(CwtError::ScopeViolation { .. })
+            ),
+            "prefix token must deny doc outside prefix"
+        );
+
+        // File-scoped token must be denied for doc access
+        let file_claims = CwtClaims {
+            issuer: None,
+            subject: None,
+            audience: Some("https://api.example.com".to_string()),
+            expiration: Some(9999999999),
+            issued_at: None,
+            scope: "file:hash123:doc_A:r".to_string(),
+            channel: None,
+        };
+        let file_token = authenticator.create_cwt(file_claims).unwrap();
+        let file_verified = authenticator
+            .verify_cwt(&file_token, "https://api.example.com")
+            .unwrap();
+        assert!(
+            matches!(
+                check_scope_for_doc(&file_verified, "doc_A"),
+                Err(CwtError::ScopeViolation { .. })
+            ),
+            "file-scoped token must not be usable for doc access"
+        );
+    }
+
     #[test]
     fn test_malformed_cwt_rejection() {
         let authenticator = create_test_authenticator();
@@ -1712,7 +1899,7 @@ mod tests {
             issuer: Some("relay-server".to_string()),
             subject: None,
             audience: Some("https://api.example.com".to_string()),
-            expiration: Some(1444064944),
+            expiration: Some(9999999999),
             issued_at: Some(1443944944),
             scope: "server".to_string(),
             channel: None,

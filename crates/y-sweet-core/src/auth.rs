@@ -1599,6 +1599,10 @@ impl Authenticator {
                 );
                 AuthError::MissingAudience { expected }
             }
+            crate::cwt::CwtError::TokenExpired => {
+                tracing::debug!("CWT token has expired");
+                AuthError::Expired
+            }
             _ => {
                 tracing::debug!("Other CWT error: {:?}", e);
                 AuthError::InvalidToken
@@ -1620,11 +1624,11 @@ impl Authenticator {
             }
         }
 
-        // Check expiration
+        // Check expiration using caller-supplied time (milliseconds) as fallback
         if let Some(exp) = claims.expiration {
             let exp_millis = exp * 1000;
             if exp_millis < current_time {
-                tracing::debug!("Token expired");
+                tracing::debug!("Token expired (caller time check)");
                 return Err(AuthError::Expired);
             }
         }
@@ -1781,6 +1785,10 @@ impl Authenticator {
                 );
                 AuthError::MissingAudience { expected }
             }
+            crate::cwt::CwtError::TokenExpired => {
+                tracing::debug!("CWT token has expired");
+                AuthError::Expired
+            }
             _ => {
                 tracing::debug!("Other CWT error: {:?}", e);
                 AuthError::InvalidToken
@@ -1802,11 +1810,11 @@ impl Authenticator {
             }
         }
 
-        // Check expiration
+        // Check expiration using caller-supplied time (milliseconds) as fallback
         if let Some(exp) = claims.expiration {
             let exp_millis = exp * 1000;
             if exp_millis < current_time {
-                tracing::debug!("Token expired");
+                tracing::debug!("Token expired (caller time check)");
                 return Err(AuthError::Expired);
             }
         }
