@@ -4,6 +4,15 @@
 
 Relay Server is a fork of [jamsocket/y-sweet](https://github.com/jamsocket/y-sweet). It exposes the same CRDT-based document store under a new name and integrates with Relay's Control Plane for authentication and permissions.
 
+---
+
+## Fork origin
+
+This repository (`entire-vc/evc-relay-server`) is a fork of [`No-Instructions/relay-server`](https://github.com/No-Instructions/relay-server).
+
+**Upstream commit pinned:** [`5d4fd161604dde305ac45f200eb8eca09c7c7f15`](https://github.com/No-Instructions/relay-server/commit/5d4fd161604dde305ac45f200eb8eca09c7c7f15) (2026-07-06)
+
+---
 
 ## Self-hosting
 
@@ -41,12 +50,12 @@ See [relay-server-template](https://github.com/no-instructions/relay-server-temp
 
 ## Features
 
- - Real‑time collaboration engine built atop y-crdt, enabling high-performance conflict‑free shared editing
+ - Real-time collaboration engine built atop y-crdt, enabling high-performance conflict-free shared editing
  - Use the Relay.md control plane for login and access control management
  - Fully private self-hosting of your documents and attachments (no connection to the public internet required!)
  - 1-step deployment into your Tailscale Tailnet
- - Persistence to S3‑compatible object storage (S3, Cloudflare R2, Minio)
- - Flexible deployment/isolation with single server or session‑per‑document model
+ - Persistence to S3-compatible object storage (S3, Cloudflare R2, Minio)
+ - Flexible deployment/isolation with single server or session-per-document model
  - Python SDK
  - Webhook Event Delivery
 
