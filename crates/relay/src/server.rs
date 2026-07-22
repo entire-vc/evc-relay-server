@@ -441,11 +441,18 @@ impl Server {
             }
         };
 
+        let doc_id_for_dirty_callback = doc_id.to_string();
         let dwskv = DocWithSyncKv::new(
             doc_id,
             self.store.clone(),
             move || {
-                send.try_send(()).unwrap();
+                // Full: persist worker is lagging, but a signal is already
+                // queued so the wake-up still happens. Closed: the worker (and
+                // likely the doc) is already gone. Neither case is recoverable
+                // or needs a second signal — drop instead of panicking (TR-33).
+                if let Err(e) = send.try_send(()) {
+                    tracing::debug!(doc_id = %doc_id_for_dirty_callback, ?e, "dirty-signal channel try_send failed");
+                }
             },
             event_callback,
         )
@@ -3084,6 +3091,51 @@ mod test {
             wait_result.is_ok(),
             "Persistence workers should terminate after GC, but they hung"
         );
+    }
+
+    /// Regression test for TR-33: the dirty-signal callback used to call
+    /// `.unwrap()` on `try_send`, panicking as soon as the receiving
+    /// persistence worker was gone and the channel closed. Cancelling the
+    /// server and draining the worker tracker guarantees the channel is
+    /// closed before we trigger one more doc update.
+    #[tokio::test]
+    async fn test_dirty_callback_does_not_panic_on_closed_channel() {
+        use yrs::{Text, Transact};
+
+        let cancellation_token = CancellationToken::new();
+        let server = Arc::new(
+            Server::new(
+                None,
+                Duration::from_secs(60),
+                None,
+                None,
+                vec![],
+                cancellation_token.clone(),
+                false, // doc_gc disabled - not relevant to this test
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+
+        let doc_id = server.create_doc().await.unwrap();
+        let awareness = server.get_or_create_doc(&doc_id).await.unwrap().awareness();
+
+        // Terminate the persistence worker so its Receiver<()> is dropped,
+        // closing the dirty-signal channel.
+        cancellation_token.cancel();
+        server.doc_worker_tracker.close();
+        tokio::time::timeout(Duration::from_secs(2), server.doc_worker_tracker.wait())
+            .await
+            .expect("persistence worker should terminate after cancellation");
+
+        // Triggering another update now invokes the dirty callback against a
+        // closed channel. Before the fix this panicked inside
+        // `send.try_send(()).unwrap()`.
+        let guard = awareness.read().unwrap();
+        let text = guard.doc().get_or_insert_text("body");
+        let mut txn = guard.doc().transact_mut();
+        text.insert(&mut txn, 0, "trigger dirty callback on closed channel");
     }
 }
 
