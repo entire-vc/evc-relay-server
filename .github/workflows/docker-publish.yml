@@ -1,12 +1,34 @@
 name: Build and publish Docker image
-
+# Two triggers:
+#  - push of a `relay-X.Y.Z` git tag -- auto-publishes on every fork release,
+#    so a merged fix reaches ghcr without anyone remembering to run this by
+#    hand (TR·relay-server audit remnant, task #975bcda1: 0.9.8/0.9.9/0.10.0/
+#    0.12.0 tags existed in this repo but were never built into images
+#    because nobody ran workflow_dispatch for them).
+#  - workflow_dispatch, kept for a manual/ad-hoc rebuild.
+#
+# The `relay-` prefix is deliberate, not decorative: this repo is a fork of
+# No-Instructions/relay-server and carries ALL of upstream's own historical
+# version tags (0.9.0 through 0.12.0) as a byproduct of forking. Those tags
+# point at upstream's commits, NOT this fork's downstream security/robustness
+# patches (verified: `git tag 0.9.8` here is upstream's own unrelated commit
+# 84a3f14, which does NOT contain this fork's PR#2/TR-33 dirty-signal fix
+# 8cd6637 -- `gh api compare` confirms 0.9.8 is neither an ancestor nor a
+# descendant of it). A bare `on: push: tags: ['[0-9]+.[0-9]+.[0-9]+']` trigger
+# would silently republish stale upstream history under a version number
+# that looks like -- but isn't -- this fork's own release. The published
+# ghcr image TAG stays plain semver (matching the existing 0.9.6/0.9.7
+# history already in ghcr) -- only the GIT tag needs the disambiguating
+# prefix, so the trigger step below strips it back off.
 on:
+  push:
+    tags: ['relay-[0-9]+.[0-9]+.[0-9]+']
   workflow_dispatch:
     inputs:
       version:
-        description: 'Image version tag (semver, e.g. 0.9.6)'
+        description: 'Image version tag (semver, e.g. 0.9.8)'
         required: true
-        default: '0.9.6'
+        default: '0.9.8'
 
 env:
   REGISTRY: ghcr.io
@@ -22,6 +44,16 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: v
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#relay-}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Log in to the Container registry
         uses: docker/login-action@v3
@@ -39,8 +71,8 @@ jobs:
           context: ./crates
           file: ./crates/Dockerfile
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.event.inputs.version }}
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.v.outputs.version }}
           build-args: |
-            RELAY_VERSION=${{ github.event.inputs.version }}
+            RELAY_VERSION=${{ steps.v.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
