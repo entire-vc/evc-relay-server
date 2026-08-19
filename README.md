@@ -10,7 +10,31 @@ Relay Server is a fork of [jamsocket/y-sweet](https://github.com/jamsocket/y-swe
 
 This repository (`entire-vc/evc-relay-server`) is a fork of [`No-Instructions/relay-server`](https://github.com/No-Instructions/relay-server).
 
-**Upstream commit pinned:** [`5d4fd161604dde305ac45f200eb8eca09c7c7f15`](https://github.com/No-Instructions/relay-server/commit/5d4fd161604dde305ac45f200eb8eca09c7c7f15) (2026-07-06)
+**Upstream base pinned:** [`5d4fd161604dde305ac45f200eb8eca09c7c7f15`](https://github.com/No-Instructions/relay-server/commit/5d4fd161604dde305ac45f200eb8eca09c7c7f15) (2026-07-06)
+
+**Cherry-picked on top of that base:**
+
+| Upstream commit | Why taken |
+|---|---|
+| [`d7ebd31`](https://github.com/No-Instructions/relay-server/commit/d7ebd3158920a6e068fee16b571ce8f57cfd9362) — *fix: guard file metadata paths and backport Yrs delete handling* | Blocks `..` path-traversal keys in the `filemeta_v0` map, and pins `yrs` to a revision that stops an out-of-order delete resurrecting a removed entry. `filemeta_v0` is the shared-folder file index used by both this server and the Obsidian plugin, so both halves are reachable here. |
+
+**Deliberately NOT taken** (reviewed 2026-08-19): the eight-commit document-lifecycle
+series `4afa487 · a0daf70 · 58cd5e1 · 82f628b · dd46897 · b3aa795 · 042fa00 ·
+2103054`, plus `fa1d3c9` (log-level tuning). That series is a coherent
+architectural rework — it introduces `doc_lifecycle.rs`, moves document identity
+into a `DocRegistry`, then hands eviction to a lifecycle actor, ~3000 changed
+lines in total. Only its first commit cherry-picks cleanly; the rest conflict
+without their predecessors. Adopting it is a project with its own behavioural
+test plan, not a cherry-pick. `e79633d` (ignore `specs/`) does not apply — this
+fork has no `specs/` directory.
+
+**Check how far behind we are:**
+
+```bash
+git remote add upstream https://github.com/No-Instructions/relay-server.git  # if absent
+git fetch upstream
+git log --oneline --date=short --format='%h %ad %s' origin/main..upstream/main
+```
 
 ### What this fork builds, and what it dropped
 
