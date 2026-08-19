@@ -94,7 +94,7 @@ Self-hosting within your private network gives you complete privacy for your doc
 docker run \
   -v data:/app/data \
   -p 8080:8080 \
-  docker.system3.md/relay-server \
+  ghcr.io/entire-vc/evc-relay-server:0.9.9 \
   http://relay-server.my-network.internal:8080  # Your internal network URL
 ```
 
@@ -159,12 +159,12 @@ prefix = ""
 
 ## Contact
 
-- Discord: [https://discord.system3.md](https://discord.system3.md)
-- Email: contact@system3.md
+- Issues: [github.com/entire-vc/evc-relay-server/issues](https://github.com/entire-vc/evc-relay-server/issues)
+- Email: in@entire.vc
 
 
 ## Acknowledgements
 
-Relay Server builds on [y-sweet](https://github.com/jamsocket/y-sweet) by the folks at Jamsocket, which in turn uses [y-crdt](https://github.com/y-crdt/y-crdt).
+This repository is a fork of [Relay Server](https://github.com/No-Instructions/relay-server) by No Instructions, LLC, which is itself built on [y-sweet](https://github.com/jamsocket/y-sweet) by the folks at Jamsocket, which in turn uses [y-crdt](https://github.com/y-crdt/y-crdt).
 
 The server source code is MIT licensed.
