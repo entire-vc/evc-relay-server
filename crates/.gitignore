@@ -1,6 +1,5 @@
 target
 .auth*
-y-sweet-worker/dist
 
 fly*.toml*
 relay-*.toml

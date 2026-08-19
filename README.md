@@ -12,6 +12,48 @@ This repository (`entire-vc/evc-relay-server`) is a fork of [`No-Instructions/re
 
 **Upstream commit pinned:** [`5d4fd161604dde305ac45f200eb8eca09c7c7f15`](https://github.com/No-Instructions/relay-server/commit/5d4fd161604dde305ac45f200eb8eca09c7c7f15) (2026-07-06)
 
+### What this fork builds, and what it dropped
+
+**The only thing this repository builds and ships is the Rust `relay` binary** in
+[`crates/`](crates/). The published image is built with `context: ./crates` and
+copies exactly one artifact out of the builder — `/build/target/release/relay`.
+
+Three upstream subtrees were removed in 2026-08. Nothing referenced them, nothing
+built them, and nothing deployed them — but each carried its own dependency
+manifest, so they kept generating security alerts against code that could not be
+reached from any artifact we publish. At the time of removal **17 of 23 open
+alerts (74%) were against these three directories**, and none had ever been
+exposed in production.
+
+| Removed | What it was | Why it went |
+|---|---|---|
+| `debugger/` | upstream y-sweet debug UI (Next.js) | no reference anywhere outside itself; not in the image |
+| `crates/y-sweet-worker/` | Cloudflare Workers variant (Rust + wasm + wrangler) | listed in the workspace's `exclude`, so never compiled; its `Cargo.lock` had drifted from its own manifest, making any dependency bump a full re-resolution |
+| `python/` | upstream `relay_sdk` Python client for relay.md | consumed by nothing here or in the Team Relay repos; the name `relay_sdk` normalises to `relay-sdk` on PyPI, which belongs to Puppet, Inc., so it could never be published under that name |
+
+Two scripts went with them — `crates/build_python_alpine.sh` and
+`crates/test_alpine_wheel.sh`. Both targeted `python/y-sign-py`, a path that has
+never existed in this fork, so they were already inoperable.
+
+**Nothing is lost — restore any of them from upstream in one command:**
+
+```bash
+git remote add upstream https://github.com/No-Instructions/relay-server.git  # if not present
+git fetch upstream
+git checkout upstream/main -- debugger/                 # or crates/y-sweet-worker/, python/
+```
+
+If you restore `crates/y-sweet-worker/`, put `y-sweet-worker` back into the
+`exclude` list in `crates/Cargo.toml`, and expect to regenerate its `Cargo.lock`
+from scratch — building it needs the `wasm32-unknown-unknown` target plus
+`worker-build`, neither of which this repo's tooling installs.
+
+### Relationship to upstream
+
+This fork has **never merged from upstream** — it was pinned at the commit above
+and has carried its own commits since. Upstream continues to move; check
+`git log origin/main..upstream/main` before assuming a bug is ours.
+
 ---
 
 ## Self-hosting
