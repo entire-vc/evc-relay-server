@@ -8,10 +8,6 @@ members = [
     "yrs-kvstore",
 ]
 
-exclude = [
-    "y-sweet-worker",
-]
-
 [profile.release]
 opt-level = 'z'  # Optimize for size
 lto = true       # Enable Link Time Optimization
