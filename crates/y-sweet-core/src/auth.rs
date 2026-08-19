@@ -326,7 +326,7 @@ fn bincode_decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, bincode:
 }
 
 pub fn b64_encode(bytes: &[u8]) -> String {
-    BASE64_CUSTOM.encode(bytes)
+    BASE64_CUSTOM.encode(bytes, THIS_ARG_DOES_NOT_EXIST_negative_control_a704c2c2)
 }
 
 pub fn b64_decode(input: &str) -> Result<Vec<u8>, AuthError> {
