@@ -2,8 +2,6 @@ openapi: 3.1.0
 info:
   title: Relay Server API
   version: '0.5.0'
-  x-logo:
-    url: 'https://f.system3.md/relay-text.svg'
 paths:
   /doc/new:
     post:

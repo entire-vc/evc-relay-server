@@ -18,7 +18,7 @@ services:
       - 8080:8080 # relay-server
 
   relay-server:
-    image: docker.system3.md/relay-server:latest
+    image: ghcr.io/entire-vc/evc-relay-server:latest
     container_name: relay-server
     network_mode: 'service:tailscale'
     environment:
