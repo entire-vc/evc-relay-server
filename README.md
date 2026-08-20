@@ -136,14 +136,12 @@ url = "https://relay.example.com"
 host = "0.0.0.0"
 port = 8080
 
-# Relay.md public keys
+# Public key of the control plane you trust to issue tokens.
+# Every key listed here can mint tokens this server accepts, so use your own
+# control plane's key — do not carry over keys from another deployment.
 [[auth]]
-key_id = "relay_2025_10_22"
-public_key = "/6OgBTHaRdWLogewMdyE+7AxnI0/HP3WGqRs/bYBlFg="
-
-[[auth]]
-key_id = "relay_2025_10_23"
-public_key = "fbm9JLHrwPpST5HAYORTQR/i1VbZ1kdp2ZEy0XpMbf0="
+key_id = "my_control_plane_2026_01_01"
+public_key = "<base64 public key>"
 
 # Document and attachment persistence
 # Supports S3-compatible storage
@@ -157,10 +155,13 @@ prefix = ""
 ```
 
 
-## Contact
+## Support and contact
 
-- Issues: [github.com/entire-vc/evc-relay-server/issues](https://github.com/entire-vc/evc-relay-server/issues)
-- Email: in@entire.vc
+- **Bug, question, or feature request** — [open an issue](https://github.com/entire-vc/evc-relay-server/issues/new/choose).
+- **Security vulnerability** — [report it privately](https://github.com/entire-vc/evc-relay-server/security/advisories/new), not as a public issue.
+- **Anything you would rather not discuss in public** — <support@entire.vc>.
+
+Response times and what to put in a bug report are in [SUPPORT.md](SUPPORT.md).
 
 
 ## Acknowledgements
