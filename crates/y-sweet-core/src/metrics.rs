@@ -21,6 +21,7 @@ pub struct RelayMetrics {
 
     // Authentication & security metrics
     pub http_auth_errors_total: CounterVec,
+    pub http_auth_success_total: CounterVec,
 
     // Object store metrics
     pub s3_requests_total: CounterVec,
@@ -128,6 +129,12 @@ impl RelayMetrics {
             &[], // Aggregate across all documents
         )?;
         registry.register(Box::new(sync_protocol_connections.clone()))?;
+        // Force the zero-label child into existence at startup. A GaugeVec with no
+        // labels otherwise has no series at all until the first `set()` call, so
+        // Prometheus scrapes report the metric family as absent — indistinguishable
+        // from "no data" — right up until the first connection opens. That gap was
+        // read as "zero data" instead of "zero connections" for 6+ months (#f3cb5365).
+        sync_protocol_connections.with_label_values(&[]).set(0.0);
 
         let sync_protocol_subscriptions_by_channel = GaugeVec::new(
             Opts::new(
@@ -157,6 +164,21 @@ impl RelayMetrics {
         )?;
         registry.register(Box::new(http_auth_errors_total.clone()))?;
 
+        // Success-side counterpart to http_auth_errors_total, sharing the `path`/`method`
+        // labels so a success rate can be computed with a single PromQL expression
+        // (successes / (successes + errors)) instead of needing an external total-request
+        // count as the denominator — without this, an error count alone can't be told apart
+        // from "0 errors out of 0 requests" (the exact ambiguity that hid the CWT auth
+        // defect, #f3cb5365).
+        let http_auth_success_total = CounterVec::new(
+            Opts::new(
+                "relay_server_http_auth_success_total",
+                "Total number of HTTP requests that passed authentication/authorization",
+            ),
+            &["path", "method"],
+        )?;
+        registry.register(Box::new(http_auth_success_total.clone()))?;
+
         // Object store metrics
         let s3_requests_total = CounterVec::new(
             Opts::new(
@@ -181,6 +203,7 @@ impl RelayMetrics {
             sync_protocol_subscriptions_by_channel,
             debounced_queue_length,
             http_auth_errors_total,
+            http_auth_success_total,
             s3_requests_total,
         }))
     }
@@ -275,6 +298,12 @@ impl RelayMetrics {
             .inc();
     }
 
+    pub fn record_http_auth_success(&self, path: &str, method: &str) {
+        self.http_auth_success_total
+            .with_label_values(&[path, method])
+            .inc();
+    }
+
     pub fn record_s3_request(&self, method: &str, outcome: &str) {
         self.s3_requests_total
             .with_label_values(&[method, outcome])
@@ -346,6 +375,35 @@ mod tests {
             .with_label_values(&["prefix_mismatch", "403", "/doc/new", "POST"])
             .get();
         assert_eq!(prefix, 1.0);
+    }
+
+    #[test]
+    fn test_http_auth_success_metrics() {
+        let metrics = RelayMetrics::new_for_test().unwrap();
+
+        metrics.record_http_auth_success("/doc/ws/:doc_id", "GET");
+        metrics.record_http_auth_success("/doc/ws/:doc_id", "GET");
+
+        let ws_success = metrics
+            .http_auth_success_total
+            .with_label_values(&["/doc/ws/:doc_id", "GET"])
+            .get();
+        assert_eq!(ws_success, 2.0);
+    }
+
+    #[test]
+    fn test_sync_protocol_connections_gauge_is_observable_at_zero() {
+        // A GaugeVec with no label dimensions has no series at all until the first
+        // `set()` call — before the startup fix, the metric family was simply absent
+        // from a scrape until the first connection opened, which is indistinguishable
+        // from "no data collected" rather than "zero connections" (#f3cb5365 / #42323ab2).
+        let metrics = RelayMetrics::new_for_test().unwrap();
+
+        let value = metrics
+            .sync_protocol_connections
+            .with_label_values(&[])
+            .get();
+        assert_eq!(value, 0.0);
     }
 
     #[test]
