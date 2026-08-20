@@ -816,11 +816,21 @@ impl SyncProtocolEventSender {
         if let Ok(mut connections) = self.doc_connections.write() {
             let doc_connections = connections.entry(doc_id.clone()).or_insert_with(Vec::new);
             doc_connections.push(connection);
+            let before_cleanup = doc_connections.len();
 
             // Clean up any dead weak references while we're here
             doc_connections.retain(|weak_conn| weak_conn.strong_count() > 0);
 
             let current_doc_connections = doc_connections.len();
+            // Live-measured (#3b690117): this retain is a real disconnect-detection
+            // path in its own right, not just incidental tidying — a WebSocket that
+            // closes without any further document update never reaches send_event's
+            // sweep, so a subsequent register_doc_connection on the SAME doc_id is
+            // often the only place that dead ref ever gets cleaned up. Skipping the
+            // closed-counter credit here would silently undercount closes for
+            // exactly the "connect, disconnect, nothing else happens on that doc"
+            // shape the counter exists to make visible.
+            let closed_here = before_cleanup - current_doc_connections;
 
             // Update metrics
             if let Some(ref metrics) = self.metrics {
@@ -831,6 +841,9 @@ impl SyncProtocolEventSender {
                     .set_sync_protocol_subscriptions_by_channel(&doc_id, current_doc_connections);
                 metrics.set_docs_active(connections.len());
                 metrics.record_doc_connection_opened();
+                if closed_here > 0 {
+                    metrics.record_doc_connections_closed(closed_here);
+                }
             }
 
             tracing::debug!(
@@ -1171,6 +1184,65 @@ mod tests {
             !series_exists,
             "doc series should be fully removed after disconnect, not left at 0"
         );
+    }
+
+    #[test]
+    fn test_register_credits_closed_counter_for_dead_refs_it_cleans_up() {
+        // Regression test for a gap found during live verification (#3b690117): a
+        // disconnect that is only ever detected by register_doc_connection's OWN
+        // retain() (because no further document event ever triggers send_event's
+        // sweep) must still be credited to doc_connections_closed_total — otherwise
+        // exactly the "connect, disconnect, nothing else happens on that doc" shape
+        // silently undercounts, which is the shape the counter most needs to catch.
+        use crate::api_types::Authorization;
+        use crate::doc_connection::DocConnection;
+
+        let metrics = RelayMetrics::new_for_test().unwrap();
+        let sender = SyncProtocolEventSender::new().with_metrics(metrics.clone());
+        let doc_id = "doc-retain-closes-test".to_string();
+
+        let awareness = Arc::new(RwLock::new(crate::sync::awareness::Awareness::new(
+            yrs::Doc::new(),
+        )));
+        let conn_a = Arc::new(DocConnection::new(
+            awareness.clone(),
+            Authorization::Full,
+            |_| {},
+        ));
+        sender.register_doc_connection(doc_id.clone(), Arc::downgrade(&conn_a));
+        drop(conn_a);
+
+        // No send_event call here — this is the point of the test: the ONLY thing
+        // that can detect conn_a's death before conn_b registers is the retain()
+        // inside register_doc_connection itself.
+        let conn_b = Arc::new(DocConnection::new(awareness, Authorization::Full, |_| {}));
+        sender.register_doc_connection(doc_id.clone(), Arc::downgrade(&conn_b));
+
+        assert_eq!(
+            metrics
+                .doc_connections_opened_total
+                .with_label_values(&[])
+                .get(),
+            2.0
+        );
+        assert_eq!(
+            metrics
+                .doc_connections_closed_total
+                .with_label_values(&[])
+                .get(),
+            1.0,
+            "conn_a's death, detected only via register's own retain(), must still be credited"
+        );
+        // Exactly conn_b remains — the doc itself stays active, just with fewer
+        // connections, so this is a set (not a remove) on the per-channel series.
+        assert_eq!(
+            metrics
+                .sync_protocol_subscriptions_by_channel
+                .with_label_values(&[doc_id.as_str()])
+                .get(),
+            1.0
+        );
+        assert_eq!(metrics.docs_active.with_label_values(&[]).get(), 1.0);
     }
 
     #[test]
