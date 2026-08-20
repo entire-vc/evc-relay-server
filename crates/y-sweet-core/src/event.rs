@@ -829,6 +829,8 @@ impl SyncProtocolEventSender {
                 metrics.set_sync_protocol_connections(total_connections);
                 metrics
                     .set_sync_protocol_subscriptions_by_channel(&doc_id, current_doc_connections);
+                metrics.set_docs_active(connections.len());
+                metrics.record_doc_connection_opened();
             }
 
             tracing::debug!(
@@ -842,15 +844,23 @@ impl SyncProtocolEventSender {
     /// Unregister all connections for a document (called when document is dropped)
     pub fn unregister_document(&self, doc_id: &str) {
         if let Ok(mut connections) = self.doc_connections.write() {
-            connections.remove(doc_id);
+            let removed = connections.remove(doc_id);
 
-            // Update metrics - set this channel to 0 subscriptions
+            // Update metrics - this document's channel has no subscriptions left
             if let Some(ref metrics) = self.metrics {
-                metrics.set_sync_protocol_subscriptions_by_channel(doc_id, 0);
+                // Remove the series entirely rather than setting it to 0 — see
+                // clear_doc_subscription's doc comment for why an unbounded doc_id
+                // label must not be left behind forever.
+                metrics.clear_doc_subscription(doc_id);
+
+                if let Some(closed_count) = removed.map(|v| v.len()).filter(|&n| n > 0) {
+                    metrics.record_doc_connections_closed(closed_count);
+                }
 
                 // Update total connections count across all documents
                 let total_connections: usize = connections.values().map(|v| v.len()).sum();
                 metrics.set_sync_protocol_connections(total_connections);
+                metrics.set_docs_active(connections.len());
             }
 
             tracing::debug!("Unregistered all DocConnections for document {}", doc_id);
@@ -949,6 +959,7 @@ impl EventSender for SyncProtocolEventSender {
         // Clean up dead weak references periodically
         if let Ok(mut connections) = self.doc_connections.write() {
             let mut metrics_updates = Vec::new();
+            let mut closed_this_sweep: usize = 0;
 
             for (doc_id, doc_connections) in connections.iter_mut() {
                 let before_count = doc_connections.len();
@@ -957,6 +968,7 @@ impl EventSender for SyncProtocolEventSender {
 
                 // Track if this channel's count changed
                 if before_count != after_count {
+                    closed_this_sweep += before_count - after_count;
                     metrics_updates.push((doc_id.clone(), after_count));
                 }
             }
@@ -975,19 +987,33 @@ impl EventSender for SyncProtocolEventSender {
             // Update metrics if we have changes
             if !metrics_updates.is_empty() || !removed_docs.is_empty() {
                 if let Some(ref metrics) = self.metrics {
-                    // Update metrics for changed channels
+                    // Update metrics for changed channels. A channel that dropped to
+                    // zero connections has its series removed entirely (not set to 0)
+                    // — see clear_doc_subscription's doc comment for why an unbounded
+                    // doc_id label must not be left behind forever.
                     for (doc_id, count) in metrics_updates {
-                        metrics.set_sync_protocol_subscriptions_by_channel(&doc_id, count);
+                        if count == 0 {
+                            metrics.clear_doc_subscription(&doc_id);
+                        } else {
+                            metrics.set_sync_protocol_subscriptions_by_channel(&doc_id, count);
+                        }
                     }
 
-                    // Update metrics for removed channels
+                    // Belt-and-suspenders: also clear channels whose key was removed
+                    // from the map this sweep (same set as the count==0 branch above
+                    // in practice, but cheap and idempotent to cover explicitly).
                     for doc_id in removed_docs {
-                        metrics.set_sync_protocol_subscriptions_by_channel(&doc_id, 0);
+                        metrics.clear_doc_subscription(&doc_id);
                     }
 
-                    // Update total connections count
+                    // Update total connections and active-document counts
                     let total_connections: usize = connections.values().map(|v| v.len()).sum();
                     metrics.set_sync_protocol_connections(total_connections);
+                    metrics.set_docs_active(connections.len());
+
+                    if closed_this_sweep > 0 {
+                        metrics.record_doc_connections_closed(closed_this_sweep);
+                    }
                 }
             }
         }
@@ -1067,6 +1093,84 @@ mod tests {
         assert_eq!(event.doc_id, doc_id);
         assert_eq!(event.user, Some(user));
         assert!(event.metadata.is_empty());
+    }
+
+    #[test]
+    fn test_register_unregister_and_sweep_track_docs_active_and_open_close_counters() {
+        // Exercises the actual glue code in register_doc_connection/send_event's
+        // dead-weak-ref sweep (not just RelayMetrics in isolation) — proves
+        // relay_server_docs_active_total, the open/close counters, and the
+        // cardinality-safe removal of the per-doc_id series all follow a real
+        // connect -> disconnect -> sweep lifecycle correctly.
+        use crate::api_types::Authorization;
+        use crate::doc_connection::DocConnection;
+        use prometheus::core::Collector;
+
+        let metrics = RelayMetrics::new_for_test().unwrap();
+        let sender = SyncProtocolEventSender::new().with_metrics(metrics.clone());
+
+        let doc_id = "doc-lifecycle-test".to_string();
+        let awareness = Arc::new(RwLock::new(crate::sync::awareness::Awareness::new(
+            yrs::Doc::new(),
+        )));
+        let connection = Arc::new(DocConnection::new(awareness, Authorization::Full, |_| {}));
+
+        sender.register_doc_connection(doc_id.clone(), Arc::downgrade(&connection));
+
+        assert_eq!(metrics.docs_active.with_label_values(&[]).get(), 1.0);
+        assert_eq!(
+            metrics
+                .doc_connections_opened_total
+                .with_label_values(&[])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            metrics.sync_protocol_connections.with_label_values(&[]).get(),
+            1.0
+        );
+        assert_eq!(
+            metrics
+                .sync_protocol_subscriptions_by_channel
+                .with_label_values(&[doc_id.as_str()])
+                .get(),
+            1.0
+        );
+
+        // Drop the only strong reference — the weak ref registered above can no
+        // longer upgrade, simulating a real disconnect.
+        drop(connection);
+
+        // send_event's dead-weak-ref sweep is what actually detects a disconnect in
+        // this codebase (there is no Drop hook on DocConnection wired to metrics) —
+        // fire an event on the same channel to trigger that cleanup pass.
+        let event = DocumentUpdatedEvent::new(doc_id.clone());
+        let envelope = EventEnvelope::new(doc_id.clone(), event);
+        sender.send_event(envelope);
+
+        assert_eq!(metrics.docs_active.with_label_values(&[]).get(), 0.0);
+        assert_eq!(
+            metrics
+                .doc_connections_closed_total
+                .with_label_values(&[])
+                .get(),
+            1.0
+        );
+        assert_eq!(
+            metrics.sync_protocol_connections.with_label_values(&[]).get(),
+            0.0
+        );
+
+        let series_exists = metrics
+            .sync_protocol_subscriptions_by_channel
+            .collect()
+            .iter()
+            .flat_map(|f| f.get_metric())
+            .any(|m| m.get_label().iter().any(|l| l.get_value() == doc_id));
+        assert!(
+            !series_exists,
+            "doc series should be fully removed after disconnect, not left at 0"
+        );
     }
 
     #[test]

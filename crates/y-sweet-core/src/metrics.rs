@@ -18,6 +18,9 @@ pub struct RelayMetrics {
     pub sync_protocol_connections: GaugeVec,
     pub sync_protocol_subscriptions_by_channel: GaugeVec,
     pub debounced_queue_length: GaugeVec,
+    pub docs_active: GaugeVec,
+    pub doc_connections_opened_total: CounterVec,
+    pub doc_connections_closed_total: CounterVec,
 
     // Authentication & security metrics
     pub http_auth_errors_total: CounterVec,
@@ -154,6 +157,42 @@ impl RelayMetrics {
         )?;
         registry.register(Box::new(debounced_queue_length.clone()))?;
 
+        // Collaborative-editing surface metrics: aggregates only, no doc_id/user_id
+        // labels. sync_protocol_subscriptions_by_channel (below) already carries
+        // doc_id, and its cardinality is bounded by clear_doc_subscription() being
+        // called whenever a document's connection count reaches zero — see that
+        // method's doc comment for why an unbounded per-doc_id label is unsafe here.
+        let docs_active = GaugeVec::new(
+            Opts::new(
+                "relay_server_docs_active_total",
+                "Number of documents with at least one active sync protocol connection",
+            ),
+            &[], // Aggregate only — see doc_id cardinality note above
+        )?;
+        registry.register(Box::new(docs_active.clone()))?;
+        // Same startup-visibility fix as sync_protocol_connections above (#f3cb5365):
+        // force the zero-label child into existence so "0 active docs" is
+        // observable from the first scrape, not indistinguishable from "no data".
+        docs_active.with_label_values(&[]).set(0.0);
+
+        let doc_connections_opened_total = CounterVec::new(
+            Opts::new(
+                "relay_server_doc_connections_opened_total",
+                "Total number of document sync-protocol connections opened",
+            ),
+            &[],
+        )?;
+        registry.register(Box::new(doc_connections_opened_total.clone()))?;
+
+        let doc_connections_closed_total = CounterVec::new(
+            Opts::new(
+                "relay_server_doc_connections_closed_total",
+                "Total number of document sync-protocol connections closed (detected via weak-reference cleanup or explicit unregister)",
+            ),
+            &[],
+        )?;
+        registry.register(Box::new(doc_connections_closed_total.clone()))?;
+
         // Authentication & Security metrics
         let http_auth_errors_total = CounterVec::new(
             Opts::new(
@@ -202,6 +241,9 @@ impl RelayMetrics {
             sync_protocol_connections,
             sync_protocol_subscriptions_by_channel,
             debounced_queue_length,
+            docs_active,
+            doc_connections_opened_total,
+            doc_connections_closed_total,
             http_auth_errors_total,
             http_auth_success_total,
             s3_requests_total,
@@ -279,10 +321,45 @@ impl RelayMetrics {
             .set(count as f64);
     }
 
+    /// Remove a document's series from sync_protocol_subscriptions_by_channel entirely,
+    /// instead of setting it to 0. doc_id is an unbounded, user-generated UUID; leaving
+    /// a permanent zero-value series behind for every document that has EVER had a
+    /// connection (rather than dropping the series once it has none) grows this metric
+    /// family forever and reproduces the exact cardinality-explosion class that took
+    /// down control-plane's /metrics scrape (#4b0eac5c, 2254 label values, 7.44MB
+    /// payload, scrape timeout). Measured live on prod 2026-08-20: 71 permanent
+    /// zero-value channel series after ~11h uptime, using the pre-existing
+    /// set(channel, 0) call sites this method replaces. Call this whenever a
+    /// document's connection count reaches zero; cardinality is then bounded by the
+    /// number of CURRENTLY active documents, not all-time-ever documents.
+    pub fn clear_doc_subscription(&self, channel: &str) {
+        // Best-effort: the series may already be gone (e.g. called twice for the same
+        // zero-transition), which is not an error worth surfacing.
+        let _ = self
+            .sync_protocol_subscriptions_by_channel
+            .remove_label_values(&[channel]);
+    }
+
     pub fn set_debounced_queue_length(&self, queue_type: &str, length: usize) {
         self.debounced_queue_length
             .with_label_values(&[queue_type])
             .set(length as f64);
+    }
+
+    pub fn set_docs_active(&self, count: usize) {
+        self.docs_active.with_label_values(&[]).set(count as f64);
+    }
+
+    pub fn record_doc_connection_opened(&self) {
+        self.doc_connections_opened_total
+            .with_label_values(&[])
+            .inc();
+    }
+
+    pub fn record_doc_connections_closed(&self, count: usize) {
+        self.doc_connections_closed_total
+            .with_label_values(&[])
+            .inc_by(count as f64);
     }
 
     // Authentication & Security metrics methods
@@ -323,6 +400,7 @@ impl Default for RelayMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prometheus::core::Collector;
 
     #[test]
     fn test_sync_protocol_subscription_metrics() {
@@ -404,6 +482,78 @@ mod tests {
             .with_label_values(&[])
             .get();
         assert_eq!(value, 0.0);
+    }
+
+    #[test]
+    fn test_docs_active_gauge() {
+        let metrics = RelayMetrics::new_for_test().unwrap();
+
+        // Observable at zero without any prior set() call (startup-visibility fix,
+        // same class as test_sync_protocol_connections_gauge_is_observable_at_zero).
+        assert_eq!(metrics.docs_active.with_label_values(&[]).get(), 0.0);
+
+        metrics.set_docs_active(3);
+        assert_eq!(metrics.docs_active.with_label_values(&[]).get(), 3.0);
+
+        metrics.set_docs_active(0);
+        assert_eq!(metrics.docs_active.with_label_values(&[]).get(), 0.0);
+    }
+
+    #[test]
+    fn test_doc_connection_open_close_counters() {
+        let metrics = RelayMetrics::new_for_test().unwrap();
+
+        metrics.record_doc_connection_opened();
+        metrics.record_doc_connection_opened();
+        assert_eq!(
+            metrics.doc_connections_opened_total.with_label_values(&[]).get(),
+            2.0
+        );
+
+        metrics.record_doc_connections_closed(2);
+        assert_eq!(
+            metrics.doc_connections_closed_total.with_label_values(&[]).get(),
+            2.0
+        );
+    }
+
+    #[test]
+    fn test_clear_doc_subscription_removes_series_not_just_zeroes_it() {
+        // Regression test for the cardinality leak this method fixes: a document
+        // that drops to zero connections must stop appearing in the metric family
+        // at all, not persist forever as a zero-value series (measured live on prod:
+        // 71 such permanent series after 11h uptime under the old set(chan, 0) path).
+        let metrics = RelayMetrics::new_for_test().unwrap();
+
+        metrics.set_sync_protocol_subscriptions_by_channel("doc-a", 2);
+        assert_eq!(
+            metrics
+                .sync_protocol_subscriptions_by_channel
+                .with_label_values(&["doc-a"])
+                .get(),
+            2.0
+        );
+
+        metrics.clear_doc_subscription("doc-a");
+
+        // Collect directly from the GaugeVec (it implements Collector itself, no
+        // Registry needed) rather than via with_label_values/get, which would
+        // silently recreate the series — that's the same lazy-child mechanism this
+        // test needs to prove was actually torn down, not merely re-triggered.
+        let series_exists = metrics
+            .sync_protocol_subscriptions_by_channel
+            .collect()
+            .iter()
+            .flat_map(|f| f.get_metric())
+            .any(|m| m.get_label().iter().any(|l| l.get_value() == "doc-a"));
+        assert!(
+            !series_exists,
+            "doc-a series should be fully removed, not left at 0"
+        );
+
+        // Calling it again on an already-absent series must not panic or error out
+        // loudly — this is the double-clear path exercised by the real cleanup sweep.
+        metrics.clear_doc_subscription("doc-a");
     }
 
     #[test]
