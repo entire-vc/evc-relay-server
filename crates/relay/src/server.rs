@@ -82,11 +82,12 @@ async fn auth_metrics_middleware(
     let resp = next.run(req).await;
     let status = resp.status();
 
+    let path = matched_path
+        .as_ref()
+        .map(|m| m.as_str())
+        .unwrap_or("unknown");
+
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-        let path = matched_path
-            .as_ref()
-            .map(|m| m.as_str())
-            .unwrap_or("unknown");
         let error_type = resp
             .extensions()
             .get::<AuthErrorType>()
@@ -97,6 +98,13 @@ async fn auth_metrics_middleware(
         server_state
             .metrics
             .record_http_auth_error(error_type, &status_str, path, &method);
+    } else if status.is_success() || status == StatusCode::SWITCHING_PROTOCOLS {
+        // The success-side counterpart to the error branch above, sharing its
+        // `path`/`method` labels — without it, "N auth errors" has no denominator
+        // to compute a success rate from (see relay_server_http_auth_success_total
+        // doc comment in metrics.rs). 101 Switching Protocols is the success status
+        // for the WS-upgrade endpoints, which don't return a 2xx.
+        server_state.metrics.record_http_auth_success(path, &method);
     }
 
     resp
