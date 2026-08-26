@@ -21,6 +21,18 @@ const S3_ENDPOINT: &str = "AWS_ENDPOINT_URL_S3"; // Using consistent naming acro
 const S3_USE_PATH_STYLE: &str = "AWS_S3_USE_PATH_STYLE";
 const DEFAULT_S3_REGION: &str = "us-east-1";
 
+/// Read the text content of an element and decode it (handles both the
+/// reader's character encoding and XML entity-escaping). `quick_xml` 0.41
+/// changed `Reader::read_text` to return a `BytesText` instead of an
+/// already-decoded `Cow<str>` (as it did in 0.31) — this restores the old
+/// call-site ergonomics in one place.
+fn read_decoded_text<'a>(
+    reader: &mut quick_xml::Reader<&'a [u8]>,
+    end: quick_xml::name::QName,
+) -> quick_xml::Result<std::borrow::Cow<'a, str>> {
+    reader.read_text(end)?.decode().map_err(Into::into)
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct S3Config {
     pub key: String,
@@ -309,7 +321,7 @@ impl S3Store {
     /// they match the keys callers use for `get`/`set`.
     fn parse_list_response(text: &str, storage_prefix: Option<&str>) -> Result<ListObjectsPage> {
         let mut reader = quick_xml::Reader::from_str(text);
-        reader.trim_text(true);
+        reader.config_mut().trim_text(true);
 
         let mut buf = Vec::new();
         let mut files = Vec::new();
@@ -328,12 +340,12 @@ impl S3Store {
                     b"Contents" => in_contents = true,
                     b"CommonPrefixes" => in_common_prefixes = true,
                     b"Key" if in_contents => {
-                        if let Ok(text) = reader.read_text(e.name()) {
+                        if let Ok(text) = read_decoded_text(&mut reader, e.name()) {
                             current_key = Some(text.to_string());
                         }
                     }
                     b"Prefix" if in_common_prefixes => {
-                        if let Ok(text) = reader.read_text(e.name()) {
+                        if let Ok(text) = read_decoded_text(&mut reader, e.name()) {
                             let stripped =
                                 Self::strip_storage_prefix(text.to_string(), storage_prefix);
                             if !stripped.is_empty() {
@@ -342,12 +354,12 @@ impl S3Store {
                         }
                     }
                     b"Size" if in_contents => {
-                        if let Ok(text) = reader.read_text(e.name()) {
+                        if let Ok(text) = read_decoded_text(&mut reader, e.name()) {
                             current_size = text.parse::<u64>().ok();
                         }
                     }
                     b"LastModified" if in_contents => {
-                        if let Ok(text) = reader.read_text(e.name()) {
+                        if let Ok(text) = read_decoded_text(&mut reader, e.name()) {
                             if let Ok(date_time) = time::OffsetDateTime::parse(
                                 &text,
                                 &time::format_description::well_known::Rfc3339,
@@ -358,12 +370,12 @@ impl S3Store {
                         }
                     }
                     b"IsTruncated" => {
-                        if let Ok(text) = reader.read_text(e.name()) {
+                        if let Ok(text) = read_decoded_text(&mut reader, e.name()) {
                             truncated = text.trim().eq_ignore_ascii_case("true");
                         }
                     }
                     b"NextContinuationToken" => {
-                        if let Ok(text) = reader.read_text(e.name()) {
+                        if let Ok(text) = read_decoded_text(&mut reader, e.name()) {
                             next_continuation_token = Some(text.to_string());
                         }
                     }
@@ -858,7 +870,7 @@ impl Store for S3Store {
         // `<DeleteMarker>` blocks).
         let text = String::from_utf8_lossy(&bytes);
         let mut reader = quick_xml::Reader::from_str(&text);
-        reader.trim_text(true);
+        reader.config_mut().trim_text(true);
 
         let mut buf = Vec::new();
         let mut versions: Vec<VersionInfo> = Vec::new();
@@ -873,22 +885,22 @@ impl Store for S3Store {
                 Ok(quick_xml::events::Event::Start(e)) => match e.name().as_ref() {
                     b"Version" => in_version = true,
                     b"Key" if in_version => {
-                        if let Ok(t) = reader.read_text(e.name()) {
+                        if let Ok(t) = read_decoded_text(&mut reader, e.name()) {
                             current_key = Some(t.to_string());
                         }
                     }
                     b"VersionId" if in_version => {
-                        if let Ok(t) = reader.read_text(e.name()) {
+                        if let Ok(t) = read_decoded_text(&mut reader, e.name()) {
                             current_version_id = Some(t.to_string());
                         }
                     }
                     b"IsLatest" if in_version => {
-                        if let Ok(t) = reader.read_text(e.name()) {
+                        if let Ok(t) = read_decoded_text(&mut reader, e.name()) {
                             current_is_latest = t.eq_ignore_ascii_case("true");
                         }
                     }
                     b"LastModified" if in_version => {
-                        if let Ok(t) = reader.read_text(e.name()) {
+                        if let Ok(t) = read_decoded_text(&mut reader, e.name()) {
                             if let Ok(dt) = OffsetDateTime::parse(
                                 &t,
                                 &time::format_description::well_known::Rfc3339,
